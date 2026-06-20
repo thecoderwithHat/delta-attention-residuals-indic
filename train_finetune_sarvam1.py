@@ -1,12 +1,13 @@
 """
-Fine-tune pretrained Sarvam-1 with Delta AttnRes on FineWeb-Edu.
+Fine-tune pretrained Sarvam-1 with Delta AttnRes on FineWeb-Edu or Sangraha.
 
 Sarvam-1 (sarvamai/sarvam-1) is a Llama-2-architecture model:
   hidden_size=2048, intermediate_size=11008, num_attention_heads=16,
   num_key_value_heads=8, num_hidden_layers=28, vocab_size=68096, head_dim=128.
 
 Loads a pretrained Sarvam-1 model, injects Delta AttnRes parameters (zero-initialized
-+ optional null source), and fine-tunes on FineWeb-Edu.
++ optional null source), and fine-tunes on FineWeb-Edu (default) or
+ai4bharat/sangraha (verified/hin) for Hindi continued pretraining.
 
 Usage:
     # Baseline fine-tune (no AttnRes, for comparison)
@@ -17,6 +18,11 @@ Usage:
 
     # Delta-V with null source
     torchrun --nproc_per_node=4 train_finetune_sarvam1.py --pretrained sarvamai/sarvam-1 --mode delta_v --null_source
+
+    # Hindi continued pretraining on Sangraha (verified/hin), 250M tokens
+    torchrun --nproc_per_node=4 train_finetune_sarvam1.py \
+        --pretrained sarvamai/sarvam-1 --mode delta_block --null_source \
+        --dataset ai4bharat/sangraha --dataset_name verified/hin --max_tokens 250000000
 """
 
 import argparse
@@ -52,8 +58,13 @@ def parse_args():
                    choices=["bias", "sigmoid_scalar", "sigmoid_vector", "learnable_alpha"])
     p.add_argument("--null_source", action="store_true",
                    help="Add null source for zero-disruption init")
-    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
-    p.add_argument("--dataset_name", default="default")
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu",
+                   help="HF dataset id. For Sarvam-1 Hindi CPT use ai4bharat/sangraha.")
+    p.add_argument("--dataset_name", default="default",
+                   help="HF dataset config name. For Sangraha Hindi use verified/hin.")
+    p.add_argument("--max_tokens", type=int, default=None,
+                   help="Cap total training tokens (across all ranks). "
+                        "Default: None (stream until --steps). Example: 250000000 for 250M.")
     p.add_argument("--seq_len", type=int, default=2048)
     p.add_argument("--steps", type=int, default=10_000)
     p.add_argument("--batch_size", type=int, default=2, help="per-GPU")
@@ -90,14 +101,22 @@ def cosine_with_warmup(step, warmup, total, lr_min_ratio):
     return lr_min_ratio + (1 - lr_min_ratio) * cos
 
 
-def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size, seed):
+def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size, seed,
+                 max_tokens_per_rank=None):
+    """Stream tokens. Stops early once max_tokens_per_rank is hit on this rank.
+
+    max_tokens_per_rank=None → stream indefinitely (until outer loop breaks).
+    """
     from datasets import load_dataset
     ds = load_dataset(dataset_name, name=config_name, split="train",
                       streaming=True)
     ds = ds.shuffle(seed=seed + rank, buffer_size=10_000)
     ds = ds.skip(rank)
     buf = []
+    produced = 0
     for sample in ds:
+        if max_tokens_per_rank is not None and produced >= max_tokens_per_rank:
+            return
         text = sample.get("text") or sample.get("content") or ""
         if not text:
             continue
@@ -105,8 +124,11 @@ def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size
         ids.append(tokenizer.eos_token_id)
         buf.extend(ids)
         while len(buf) >= seq_len + 1:
+            if max_tokens_per_rank is not None and produced >= max_tokens_per_rank:
+                return
             chunk = buf[:seq_len + 1]
             buf = buf[world_size * seq_len:]
+            produced += seq_len
             yield torch.tensor(chunk, dtype=torch.long)
 
 
@@ -298,8 +320,26 @@ def main():
 
     # ── data ──
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
+
+    # Per-rank token budget: total / world_size (so the *sum* across ranks hits the cap).
+    # None → no cap, stream until --steps is reached.
+    if args.max_tokens is not None:
+        if args.max_tokens <= 0:
+            raise ValueError(f"--max_tokens must be positive, got {args.max_tokens}")
+        if args.max_tokens < world_size * args.batch_size * args.grad_accum * args.seq_len:
+            raise ValueError(
+                f"--max_tokens ({args.max_tokens}) is too small for one optimizer step "
+                f"(need at least {world_size * args.batch_size * args.grad_accum * args.seq_len} tokens)")
+        max_tokens_per_rank = args.max_tokens // world_size
+        if is_main:
+            print(f"Token budget: {args.max_tokens/1e6:.1f}M total "
+                  f"({max_tokens_per_rank/1e6:.1f}M per rank)")
+    else:
+        max_tokens_per_rank = None
+
     stream = token_stream(args.dataset, args.dataset_name, tokenizer,
-                          args.seq_len, rank, world_size, args.seed)
+                          args.seq_len, rank, world_size, args.seed,
+                          max_tokens_per_rank=max_tokens_per_rank)
 
     # ── training ──
     os.makedirs(args.out_dir, exist_ok=True)
