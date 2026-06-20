@@ -1,0 +1,19 @@
+[project]
+name = "sarvam1delta-attention-residuals-code"
+version = "0.1.0"
+description = "Training scripts with Transformers, PyTorch, W&B, and Accelerate"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "transformers==5.5.0",
+    "torch",
+    "wandb",
+    "accelerate",
+]
+
+[tool.uv]
+package = false
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
