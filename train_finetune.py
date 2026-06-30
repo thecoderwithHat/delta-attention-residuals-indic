@@ -88,9 +88,9 @@ def cosine_with_warmup(step, warmup, total, lr_min_ratio):
     return lr_min_ratio + (1 - lr_min_ratio) * cos
 
 
-def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size, seed):
+def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size, seed, split="train"):
     from datasets import load_dataset
-    ds = load_dataset(dataset_name, name=config_name, split="train",
+    ds = load_dataset(dataset_name, name=config_name, split=split,
                       streaming=True)
     ds = ds.shuffle(seed=seed + rank, buffer_size=10_000)
     ds = ds.skip(rank)
@@ -109,12 +109,12 @@ def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size
 
 
 def eval_validation(model, dataset_name, config_name, tokenizer, seq_len,
-                    eval_steps, device, seed):
+                    eval_steps, device, seed,split="test"):
     """Evaluate on a deterministic stream from the selected dataset."""
     model.eval()
     stream = token_stream(
         dataset_name, config_name, tokenizer, seq_len,
-        rank=0, world_size=1, seed=seed + 9999,
+        rank=0, world_size=1, seed=seed + 9999,split=split,
     )
 
     nlls = []
