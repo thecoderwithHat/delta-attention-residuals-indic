@@ -1,5 +1,5 @@
 """
-Train Qwen3-8B / Qwen3-AttnRes-8B from scratch on FineWeb-Edu using FSDP.
+Train Qwen3-8B / Qwen3-AttnRes-8B from scratch on FineWeb 2 using FSDP.
 
 Requires FSDP for 7B+ models that don't fit in single-GPU DDP.
 Uses gradient checkpointing to reduce activation memory.
@@ -54,8 +54,10 @@ def parse_args():
     p.add_argument("--gate_type", default="bias",
                    choices=["bias", "sigmoid_scalar", "sigmoid_vector", "learnable_alpha"])
     p.add_argument("--null_source", action="store_true")
-    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
-    p.add_argument("--dataset_name", default="default")
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-2",
+                   help="Hugging Face dataset id")
+    p.add_argument("--dataset_name", default="aai_Latn",
+                   help="Dataset config (default: small Arifama-Miniafia subset)")
     p.add_argument("--seq_len", type=int, default=2048)
     p.add_argument("--steps", type=int, default=20_000)
     p.add_argument("--batch_size", type=int, default=2, help="per-GPU micro batch")

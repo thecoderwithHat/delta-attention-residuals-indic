@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs and experiment outputs
+logs/
+runs/
+wandb/
+checkpoints/
+outputs/
+modal_jobs/
+
+# Local env files
+.env
+.env.*
+
+# claude/codex
+.claude/

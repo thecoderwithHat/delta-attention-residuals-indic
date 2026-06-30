@@ -1,12 +1,12 @@
 """
-Fine-tune pretrained Sarvam-1 with Delta AttnRes on FineWeb-Edu or Sangraha.
+Fine-tune pretrained Sarvam-1 with Delta AttnRes on FineWeb 2 or Sangraha.
 
 Sarvam-1 (sarvamai/sarvam-1) is a Llama-2-architecture model:
   hidden_size=2048, intermediate_size=11008, num_attention_heads=16,
   num_key_value_heads=8, num_hidden_layers=28, vocab_size=68096, head_dim=128.
 
 Loads a pretrained Sarvam-1 model, injects Delta AttnRes parameters (zero-initialized
-+ optional null source), and fine-tunes on FineWeb-Edu (default) or
++ optional null source), and fine-tunes on FineWeb 2 (default) or
 ai4bharat/sangraha (verified/hin) for Hindi continued pretraining.
 
 Usage:
@@ -58,10 +58,11 @@ def parse_args():
                    choices=["bias", "sigmoid_scalar", "sigmoid_vector", "learnable_alpha"])
     p.add_argument("--null_source", action="store_true",
                    help="Add null source for zero-disruption init")
-    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu",
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-2",
                    help="HF dataset id. For Sarvam-1 Hindi CPT use ai4bharat/sangraha.")
-    p.add_argument("--dataset_name", default="default",
-                   help="HF dataset config name. For Sangraha Hindi use verified/hin.")
+    p.add_argument("--dataset_name", default="aai_Latn",
+                   help="Dataset config (small Arifama-Miniafia subset by default). "
+                        "For Sangraha Hindi use verified/hin.")
     p.add_argument("--max_tokens", type=int, default=None,
                    help="Cap total training tokens (across all ranks). "
                         "Default: None (stream until --steps). Example: 250000000 for 250M.")

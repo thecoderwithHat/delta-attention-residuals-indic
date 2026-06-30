@@ -1,8 +1,8 @@
 """
-Fine-tune pretrained Qwen3 with Delta AttnRes on FineWeb-Edu.
+Fine-tune pretrained Qwen3 with Delta AttnRes on FineWeb 2.
 
 Loads a pretrained Qwen3 model (e.g. Qwen/Qwen3-0.6B), injects Delta AttnRes
-parameters (zero-initialized + optional null source), and fine-tunes on FineWeb-Edu.
+parameters (zero-initialized + optional null source), and fine-tunes on FineWeb 2.
 
 Usage:
     # Baseline fine-tune (no AttnRes, for comparison)
@@ -48,8 +48,10 @@ def parse_args():
                    choices=["bias", "sigmoid_scalar", "sigmoid_vector", "learnable_alpha"])
     p.add_argument("--null_source", action="store_true",
                    help="Add null source for zero-disruption init")
-    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
-    p.add_argument("--dataset_name", default="default")
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-2",
+                   help="Hugging Face dataset id")
+    p.add_argument("--dataset_name", default="aai_Latn",
+                   help="Dataset config (default: small Arifama-Miniafia subset)")
     p.add_argument("--seq_len", type=int, default=2048)
     p.add_argument("--steps", type=int, default=10_000)
     p.add_argument("--batch_size", type=int, default=2, help="per-GPU")
@@ -107,7 +109,7 @@ def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size
 
 
 def eval_validation(model, tokenizer, seq_len, eval_steps, device):
-    """Quick validation on FineWeb-Edu."""
+    """Quick validation on WikiText-2."""
     from datasets import load_dataset
     model.eval()
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")

@@ -37,14 +37,22 @@ pip install torch transformers datasets wandb
 ### Training from scratch (220M--1B, DDP)
 
 ```bash
-# Baseline
-torchrun --standalone --nproc_per_node=8 train_scratch.py --mode baseline
+# FineWeb 2 defaults to the small aai_Latn subset for smoke testing
+torchrun --standalone --nproc_per_node=1 train_scratch.py \
+    --mode baseline --steps 2 --eval_every 0
 
 # Delta Block (recommended)
 torchrun --standalone --nproc_per_node=8 train_scratch.py --mode delta_block --compile_model
 
 # Delta AttnRes (per-sublayer)
 torchrun --standalone --nproc_per_node=8 train_scratch.py --mode delta --compile_model
+```
+
+Choose another FineWeb 2 language by passing its language-script subset:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train_scratch.py \
+    --dataset HuggingFaceFW/fineweb-2 --dataset_name hrv_Latn
 ```
 
 ### Training from scratch (7B+, FSDP)
