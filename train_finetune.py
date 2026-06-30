@@ -108,20 +108,19 @@ def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size
             yield torch.tensor(chunk, dtype=torch.long)
 
 
-def eval_validation(model, tokenizer, seq_len, eval_steps, device):
-    """Quick validation on WikiText-2."""
-    from datasets import load_dataset
+def eval_validation(model, dataset_name, config_name, tokenizer, seq_len,
+                    eval_steps, device, seed):
+    """Evaluate on a deterministic stream from the selected dataset."""
     model.eval()
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    text = "\n\n".join(ds["text"])
-    encodings = tokenizer(text, return_tensors="pt")
-    input_ids = encodings.input_ids.to(device)
+    stream = token_stream(
+        dataset_name, config_name, tokenizer, seq_len,
+        rank=0, world_size=1, seed=seed + 9999,
+    )
 
     nlls = []
     total_tokens = 0
-    for begin in range(0, min(input_ids.size(1), eval_steps * seq_len), seq_len):
-        end = min(begin + seq_len, input_ids.size(1))
-        chunk = input_ids[:, begin:end]
+    for _, token_chunk in zip(range(eval_steps), stream):
+        chunk = token_chunk[:-1].unsqueeze(0).to(device)
         with torch.no_grad():
             outputs = model(input_ids=chunk, use_cache=False)
             logits = outputs.logits
@@ -132,6 +131,11 @@ def eval_validation(model, tokenizer, seq_len, eval_steps, device):
                        shift_labels.view(-1))
         nlls.append(nll.item())
         total_tokens += shift_labels.numel()
+
+    if total_tokens == 0:
+        raise RuntimeError(
+            f"No validation tokens found in {dataset_name} ({config_name})"
+        )
 
     avg_nll = sum(nlls) / total_tokens
     ppl = math.exp(avg_nll)
@@ -372,11 +376,12 @@ def main():
         # ── validation ──
         if is_main and args.eval_every > 0 and global_step % args.eval_every == 0:
             val_loss, val_ppl = eval_validation(
-                model.module, tokenizer, args.seq_len, args.eval_steps, device)
-            print(f"  [val] step {global_step} | WT2 loss {val_loss:.4f} | PPL {val_ppl:.2f}")
+                model.module, args.dataset, args.dataset_name, tokenizer,
+                args.seq_len, args.eval_steps, device, args.seed)
+            print(f"  [val] step {global_step} | loss {val_loss:.4f} | PPL {val_ppl:.2f}")
             if use_wandb:
                 import wandb
-                wandb.log({"val/wt2_loss": val_loss, "val/wt2_ppl": val_ppl}, step=global_step)
+                wandb.log({"val/loss": val_loss, "val/ppl": val_ppl}, step=global_step)
 
         if is_main and global_step % args.save_every == 0:
             ckpt_dir = os.path.join(args.out_dir, f"step-{global_step}")
