@@ -1,8 +1,8 @@
 """
-Fine-tune pretrained Qwen3 with Delta AttnRes on FineWeb-Edu.
+Fine-tune pretrained Qwen3 with Delta AttnRes on FineWeb 2.
 
 Loads a pretrained Qwen3 model (e.g. Qwen/Qwen3-0.6B), injects Delta AttnRes
-parameters (zero-initialized + optional null source), and fine-tunes on FineWeb-Edu.
+parameters (zero-initialized + optional null source), and fine-tunes on FineWeb 2.
 
 Usage:
     # Baseline fine-tune (no AttnRes, for comparison)
@@ -48,8 +48,10 @@ def parse_args():
                    choices=["bias", "sigmoid_scalar", "sigmoid_vector", "learnable_alpha"])
     p.add_argument("--null_source", action="store_true",
                    help="Add null source for zero-disruption init")
-    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
-    p.add_argument("--dataset_name", default="default")
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-2",
+                   help="Hugging Face dataset id")
+    p.add_argument("--dataset_name", default="aai_Latn",
+                   help="Dataset config (default: small Arifama-Miniafia subset)")
     p.add_argument("--seq_len", type=int, default=2048)
     p.add_argument("--steps", type=int, default=10_000)
     p.add_argument("--batch_size", type=int, default=2, help="per-GPU")
@@ -86,9 +88,9 @@ def cosine_with_warmup(step, warmup, total, lr_min_ratio):
     return lr_min_ratio + (1 - lr_min_ratio) * cos
 
 
-def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size, seed):
+def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size, seed, split="train"):
     from datasets import load_dataset
-    ds = load_dataset(dataset_name, name=config_name, split="train",
+    ds = load_dataset(dataset_name, name=config_name, split=split,
                       streaming=True)
     ds = ds.shuffle(seed=seed + rank, buffer_size=10_000)
     ds = ds.skip(rank)
@@ -106,20 +108,19 @@ def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size
             yield torch.tensor(chunk, dtype=torch.long)
 
 
-def eval_validation(model, tokenizer, seq_len, eval_steps, device):
-    """Quick validation on FineWeb-Edu."""
-    from datasets import load_dataset
+def eval_validation(model, dataset_name, config_name, tokenizer, seq_len,
+                    eval_steps, device, seed,split="test"):
+    """Evaluate on a deterministic stream from the selected dataset."""
     model.eval()
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    text = "\n\n".join(ds["text"])
-    encodings = tokenizer(text, return_tensors="pt")
-    input_ids = encodings.input_ids.to(device)
+    stream = token_stream(
+        dataset_name, config_name, tokenizer, seq_len,
+        rank=0, world_size=1, seed=seed + 9999,split=split,
+    )
 
     nlls = []
     total_tokens = 0
-    for begin in range(0, min(input_ids.size(1), eval_steps * seq_len), seq_len):
-        end = min(begin + seq_len, input_ids.size(1))
-        chunk = input_ids[:, begin:end]
+    for _, token_chunk in zip(range(eval_steps), stream):
+        chunk = token_chunk[:-1].unsqueeze(0).to(device)
         with torch.no_grad():
             outputs = model(input_ids=chunk, use_cache=False)
             logits = outputs.logits
@@ -130,6 +131,11 @@ def eval_validation(model, tokenizer, seq_len, eval_steps, device):
                        shift_labels.view(-1))
         nlls.append(nll.item())
         total_tokens += shift_labels.numel()
+
+    if total_tokens == 0:
+        raise RuntimeError(
+            f"No validation tokens found in {dataset_name} ({config_name})"
+        )
 
     avg_nll = sum(nlls) / total_tokens
     ppl = math.exp(avg_nll)
@@ -370,11 +376,12 @@ def main():
         # ── validation ──
         if is_main and args.eval_every > 0 and global_step % args.eval_every == 0:
             val_loss, val_ppl = eval_validation(
-                model.module, tokenizer, args.seq_len, args.eval_steps, device)
-            print(f"  [val] step {global_step} | WT2 loss {val_loss:.4f} | PPL {val_ppl:.2f}")
+                model.module, args.dataset, args.dataset_name, tokenizer,
+                args.seq_len, args.eval_steps, device, args.seed)
+            print(f"  [val] step {global_step} | loss {val_loss:.4f} | PPL {val_ppl:.2f}")
             if use_wandb:
                 import wandb
-                wandb.log({"val/wt2_loss": val_loss, "val/wt2_ppl": val_ppl}, step=global_step)
+                wandb.log({"val/loss": val_loss, "val/ppl": val_ppl}, step=global_step)
 
         if is_main and global_step % args.save_every == 0:
             ckpt_dir = os.path.join(args.out_dir, f"step-{global_step}")

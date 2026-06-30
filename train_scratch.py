@@ -1,5 +1,5 @@
 """
-Train Qwen3 / Qwen3-AttnRes from scratch on FineWeb-Edu.
+Train Qwen3 / Qwen3-AttnRes from scratch on FineWeb 2.
 
 Usage:
     # Baseline (no AttnRes)
@@ -48,8 +48,10 @@ def parse_args():
                    help="Gate type for mixing AttnRes output with residual stream")
     p.add_argument("--null_source", action="store_true",
                    help="Add null source for identity init")
-    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
-    p.add_argument("--dataset_name", default="default")
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-2",
+                   help="Hugging Face dataset id")
+    p.add_argument("--dataset_name", default="aai_Latn",
+                   help="Dataset config (default: small Arifama-Miniafia subset)")
     p.add_argument("--seq_len", type=int, default=2048)
     p.add_argument("--steps", type=int, default=20_000)
     p.add_argument("--batch_size", type=int, default=4, help="per-GPU")
