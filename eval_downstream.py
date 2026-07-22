@@ -50,6 +50,8 @@ PAPER_TASKS = [
     "boolq",
     "mmlu",
     "lambada_openai",
+    "milu",
+    "ifeval_hi",
 ]
 
 # Concise task set for quick sanity checks
