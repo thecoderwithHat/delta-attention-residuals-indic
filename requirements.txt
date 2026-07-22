@@ -2,3 +2,5 @@ transformers==5.5.0
 torch
 wandb
 accelerate
+datasets>=5.0.0
+lm-eval[ifeval]>=0.4.12

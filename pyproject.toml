@@ -11,7 +11,7 @@ dependencies = [
     "accelerate",
     "nvidia-cufile>=1.15.1.6",
     "datasets>=5.0.0",
-    "lm-eval>=0.4.12",
+    "lm-eval[ifeval]>=0.4.12",
 ]
 
 [tool.uv]

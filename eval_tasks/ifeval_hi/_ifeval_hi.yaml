@@ -1,0 +1,5 @@
+group: ifeval_hi
+task:
+  - ifevalhi
+metadata:
+  version: 1.0
