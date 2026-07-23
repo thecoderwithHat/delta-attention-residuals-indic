@@ -77,6 +77,36 @@ torchrun --standalone --nproc_per_node=4 train_finetune.py \
     --steps 20000
 ```
 
+### Indic benchmarks
+
+`eval_downstream.py` includes the official MILU task definitions for all 11
+languages and NVIDIA IFEval-Hi with Hindi-aware strict, loose, and normalized
+instruction-following metrics.
+
+MILU is gated. Accept the dataset terms at
+<https://huggingface.co/datasets/ai4bharat/MILU> and set `HF_TOKEN` before
+running the published 5-shot setup:
+
+```bash
+python eval_downstream.py \
+    --model_path Qwen/Qwen3-0.6B \
+    --mode baseline \
+    --tasks milu \
+    --num_fewshot 5 \
+    --apply_chat_template
+```
+
+Use `--tasks milu_Hindi` for Hindi only. Run the linked IFEval-Hi benchmark
+separately because it is zero-shot and generates up to 4,096 tokens:
+
+```bash
+python eval_downstream.py \
+    --model_path Qwen/Qwen3-0.6B \
+    --mode baseline \
+    --tasks ifeval_hi \
+    --apply_chat_template
+```
+
 ## Results & W&B Runs
 
 The exact W&B run for every paper experiment is listed in [`WANDB_RUNS.md`](./WANDB_RUNS.md) (training/validation curves, configs, and system metrics). Project: <https://wandb.ai/wdlctc_abr/attention-residual-h100>.

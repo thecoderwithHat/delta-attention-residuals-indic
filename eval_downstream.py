@@ -19,6 +19,14 @@ Usage:
 
     # All benchmarks for paper table
     python eval_downstream.py --model_path Qwen/Qwen3-0.6B --mode baseline --tasks paper
+
+    # Official 5-shot MILU suite (requires accepted dataset access)
+    python eval_downstream.py --model_path Qwen/Qwen3-0.6B --mode baseline \
+        --tasks milu --num_fewshot 5 --apply_chat_template
+
+    # Hindi instruction following
+    python eval_downstream.py --model_path Qwen/Qwen3-0.6B --mode baseline \
+        --tasks ifeval_hi --apply_chat_template
 """
 
 import argparse
@@ -27,7 +35,10 @@ import os
 import sys
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Attention-Residuals"))
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+LOCAL_TASKS_PATH = os.path.join(REPO_ROOT, "eval_tasks")
+
+sys.path.insert(0, os.path.join(REPO_ROOT, "Attention-Residuals"))
 
 
 PAPER_TASKS = [
@@ -39,10 +50,14 @@ PAPER_TASKS = [
     "boolq",
     "mmlu",
     "lambada_openai",
+    "milu",
+    "ifeval_hi",
 ]
 
 # Concise task set for quick sanity checks
 QUICK_TASKS = ["hellaswag", "arc_easy", "piqa", "lambada_openai"]
+
+CUSTOM_TASK_PREFIXES = ("milu", "ifeval_hi", "ifevalhi")
 
 
 def parse_args():
@@ -56,13 +71,15 @@ def parse_args():
     p.add_argument("--tasks", default="paper",
                    help="Comma-separated task list, or 'paper' / 'quick'")
     p.add_argument("--num_fewshot", type=int, default=0,
-                   help="Number of few-shot examples (0 for zero-shot)")
+                   help="Number of few-shot examples (MILU's published setup uses 5)")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--output_dir", default=None,
                    help="Directory to save results JSON")
     p.add_argument("--limit", type=int, default=None,
                    help="Limit number of examples per task (for debugging)")
+    p.add_argument("--apply_chat_template", action="store_true",
+                   help="Apply the tokenizer chat template (recommended for instruction models)")
     return p.parse_args()
 
 
@@ -90,10 +107,12 @@ def load_model_and_tokenizer(model_path, mode, device):
     return model, tokenizer
 
 
-def eval_with_lm_eval(model, tokenizer, tasks, num_fewshot, batch_size, device, limit=None):
+def eval_with_lm_eval(model, tokenizer, tasks, num_fewshot, batch_size, device,
+                      limit=None, apply_chat_template=False):
     """Run lm-evaluation-harness on loaded model."""
     import lm_eval
     from lm_eval.models.huggingface import HFLM
+    from lm_eval.tasks import TaskManager
 
     lm = HFLM(
         pretrained=model,
@@ -108,6 +127,8 @@ def eval_with_lm_eval(model, tokenizer, tasks, num_fewshot, batch_size, device, 
         num_fewshot=num_fewshot,
         limit=limit,
         batch_size=batch_size,
+        apply_chat_template=apply_chat_template,
+        task_manager=TaskManager(include_path=LOCAL_TASKS_PATH),
     )
 
     return results
@@ -348,11 +369,12 @@ def main():
         print("Using lm-evaluation-harness...")
         results = eval_with_lm_eval(
             model, tokenizer, tasks, args.num_fewshot,
-            args.batch_size, args.device, args.limit)
+            args.batch_size, args.device, args.limit,
+            args.apply_chat_template)
 
         # Print summary
         print("\n" + "=" * 60)
-        print(f"RESULTS ({args.mode}) — {args.model_path}")
+        print(f"RESULTS ({args.mode}) - {args.model_path}")
         print("=" * 60)
         for task_name, task_results in results["results"].items():
             metrics = {k: v for k, v in task_results.items()
@@ -361,6 +383,15 @@ def main():
                 print(f"  {task_name}/{metric}: {value:.4f}")
 
     except ImportError:
+        unsupported = [
+            task for task in tasks
+            if task.startswith(CUSTOM_TASK_PREFIXES) or task == "milu"
+        ]
+        if unsupported:
+            raise RuntimeError(
+                "lm-eval is required for the custom benchmark tasks: "
+                + ", ".join(unsupported)
+            )
         print("lm-eval not installed, using manual evaluation...")
         print("(Install with: pip install lm-eval>=0.4.0)")
         print()
@@ -377,6 +408,7 @@ def main():
                 "mode": args.mode,
                 "tasks": tasks,
                 "num_fewshot": args.num_fewshot,
+                "apply_chat_template": args.apply_chat_template,
                 "results": results.get("results", results),
             }, f, indent=2, default=str)
         print(f"\nResults saved → {out_file}")
