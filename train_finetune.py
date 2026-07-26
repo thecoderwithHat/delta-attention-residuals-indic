@@ -387,13 +387,13 @@ def main():
             ckpt_dir = os.path.join(args.out_dir, f"step-{global_step}")
             model.module.save_pretrained(ckpt_dir)
             tokenizer.save_pretrained(ckpt_dir)
-            print(f"Saved checkpoint → {ckpt_dir}")
+            print(f"Saved checkpoint -> {ckpt_dir}")
 
     if is_main:
         final_dir = os.path.join(args.out_dir, "final")
         model.module.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
-        print(f"Training done. Final model → {final_dir}")
+        print(f"Training done. Final model -> {final_dir}")
         if use_wandb:
             import wandb
             wandb.finish()

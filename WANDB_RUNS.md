@@ -8,7 +8,7 @@ W&B project landing page: <https://wandb.ai/wdlctc_abr/attention-residual-h100>
 
 ---
 
-## Table 1 — Main results (10K steps, FineWeb-Edu)
+## Table 1 - Main results (10K steps, FineWeb-Edu)
 
 ### 220M ($d{=}768$, $L{=}12$)
 
@@ -42,7 +42,7 @@ W&B project landing page: <https://wandb.ai/wdlctc_abr/attention-residual-h100>
 
 ---
 
-## Table 2 — From-scratch Qwen3-0.6B ($d{=}1024$, $L{=}28$, $N{=}28$, 10K steps, lr $6{\times}10^{-4}$)
+## Table 2 - From-scratch Qwen3-0.6B ($d{=}1024$, $L{=}28$, $N{=}28$, 10K steps, lr $6{\times}10^{-4}$)
 
 | Method | Val PPL | W&B Run |
 |---|---|---|
@@ -52,7 +52,7 @@ W&B project landing page: <https://wandb.ai/wdlctc_abr/attention-residual-h100>
 
 ---
 
-## Table 3 — Scaling to 8B ($d{=}4096$, $L{=}36$, 10K steps, FSDP on 8×H100)
+## Table 3 - Scaling to 8B ($d{=}4096$, $L{=}36$, 10K steps, FSDP on 8×H100)
 
 | Method | Val PPL | W&B Run |
 |---|---|---|
@@ -64,7 +64,7 @@ Tok/s and memory in the paper are reported from dedicated benchmark runs (`bench
 
 ---
 
-## Table 4 — Delta Block block-size ablation (10K steps)
+## Table 4 - Delta Block block-size ablation (10K steps)
 
 ### 220M ($L{=}12$)
 
@@ -91,7 +91,7 @@ Tok/s and memory in the paper are reported from dedicated benchmark runs (`bench
 
 ---
 
-## Table 5 — Fine-tuning Qwen3-0.6B on FineWeb-Edu
+## Table 5 - Fine-tuning Qwen3-0.6B on FineWeb-Edu
 
 | Method | W&B Run |
 |---|---|

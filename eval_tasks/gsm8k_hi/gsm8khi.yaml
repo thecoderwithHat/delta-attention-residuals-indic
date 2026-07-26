@@ -1,0 +1,55 @@
+tag:
+  - math_word_problems
+task: gsm8khi
+dataset_path: nvidia/GSM8K-Hi
+dataset_name: main
+output_type: generate_until
+training_split: test
+fewshot_split: test
+test_split: test
+doc_to_text: "नीचे एक गणित का प्रश्न है। मैं चाहता हूँ कि आप पहले उत्तर तक पहुँचने के लिए आवश्यक चरणों के बारे में सोचें, फिर अपने उत्तर को \"#### \" के साथ समाप्त करें और उसके बाद उत्तर लिखें। उदाहरण के लिए, यदि उत्तर 42 है, तो आपके उत्तर को \"#### 42\" (उद्धरण चिह्नों के बिना) के साथ समाप्त होना चाहिए।\n\n{{question}}"
+doc_to_target: "{{answer}}"
+target_delimiter: "END_OF_QUESTION"
+fewshot_delimiter: "\n\n[FEW SHOT EXAMPLE SEP]\n\n"
+generation_kwargs:
+  until:
+    - "<|endoftext|>"
+    - "<extra_id_1>"
+    - "<extra_id_1>User"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 1024
+repeats: 1
+num_fewshot: 0
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: false
+    regexes_to_ignore:
+      - ","
+      - "\\$"
+      - "(?s).*#### "
+      - "\\.$"
+filter_list:
+  - name: strict-match
+    filter:
+      - function: regex
+        regex_pattern: "#### (\\-?[0-9\\.\\,]+)"
+      - function: take_first
+  - name: strict-match-custom
+    filter:
+      - function: regex
+        regex_pattern: "-?[\\d,]+(?:\\.\\d+)?"
+        group_select: -1
+      - function: take_first
+  - name: flexible-extract
+    filter:
+      - function: regex
+        group_select: -1
+        regex_pattern: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+      - function: take_first
+metadata:
+  version: 3.0

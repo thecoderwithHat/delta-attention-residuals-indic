@@ -80,8 +80,8 @@ torchrun --standalone --nproc_per_node=4 train_finetune.py \
 ### Indic benchmarks
 
 `eval_downstream.py` includes the official MILU task definitions for all 11
-languages and NVIDIA IFEval-Hi with Hindi-aware strict, loose, and normalized
-instruction-following metrics.
+languages, NVIDIA IFEval-Hi with Hindi-aware instruction-following metrics,
+GSM8K-Hi for mathematical reasoning, and BFCL-Hi for function calling.
 
 MILU is gated. Accept the dataset terms at
 <https://huggingface.co/datasets/ai4bharat/MILU> and set `HF_TOKEN` before
@@ -106,6 +106,30 @@ python eval_downstream.py \
     --tasks ifeval_hi \
     --apply_chat_template
 ```
+
+Run GSM8K-Hi zero-shot with NVIDIA's Hindi chain-of-thought prompt:
+
+```bash
+python eval_downstream.py \
+    --model_path Qwen/Qwen3-0.6B \
+    --mode baseline \
+    --tasks gsm8khi \
+    --apply_chat_template
+```
+
+BFCL-Hi downloads the benchmark's raw JSONL files through the Hugging Face Hub
+and uses the tokenizer's tool-aware chat template. It evaluates simple,
+multiple, parallel, parallel-multiple, relevance, and irrelevance categories:
+
+```bash
+python eval_downstream.py \
+    --model_path Qwen/Qwen3-0.6B \
+    --mode baseline \
+    --tasks bfcl_hi
+```
+
+For a short smoke test, add `--limit 10`. Select categories with
+`--bfcl_categories simple,parallel`; the default is `all`.
 
 ## Results & W&B Runs
 
