@@ -8,7 +8,7 @@ previous block representations, as described in:
 For pretrained model conversion, we use a **recency bias** approach:
 a large learnable bias on the last element (partial_block) in the depth-
 attention logits makes softmax put ~100% weight on it at init.  This means
-block_attn_res(...) ≈ partial_block at init → the model is mathematically
+block_attn_res(...) ≈ partial_block at init -> the model is mathematically
 equivalent to standard Qwen3.  During training the bias and proj weights
 co-adapt, letting the model learn cross-block attention.
 """
@@ -197,7 +197,7 @@ def block_attn_res(
     """
     Attend over all block representations + the current partial block.
 
-    Returns a [B, T, D] tensor — the attended aggregation of depth history.
+    Returns a [B, T, D] tensor - the attended aggregation of depth history.
     If return_entropy=True, also returns a scalar entropy value.
     """
     # Stack outside compiled region so torch.compile sees a tensor, not a list
@@ -259,7 +259,7 @@ def delta_attn_res(
     This enables exact identity initialization for fine-tuning pretrained models.
 
         h = partial_block + weighted_sum([null_source] + deltas)
-        init: null_source=0, proj=0 → uniform weights → Σα·v ≈ 0 → h ≈ partial_block
+        init: null_source=0, proj=0 -> uniform weights -> Σα·v ≈ 0 -> h ≈ partial_block
     """
     if not deltas and null_source is None:
         if return_entropy:
@@ -301,7 +301,7 @@ def gated_delta_attn_res(
     Gated Attention Residuals with pre-softmax source gating.
 
     1. Gate each source: V_gated = sigmoid(gate_proj(partial)) * V
-       → filter which source dimensions are useful before routing
+       -> filter which source dimensions are useful before routing
     2. Softmax attention over gated sources
     3. Add selected to residual stream
 
@@ -317,7 +317,7 @@ def gated_delta_attn_res(
     V = torch.stack(deltas, dim=0)
 
     # Pre-softmax gate: filter sources based on current hidden state
-    # gate: (B, T, D) → broadcast over N sources
+    # gate: (B, T, D) -> broadcast over N sources
     gate = torch.sigmoid(gate_proj(partial_block))  # (B, T, D)
     V_gated = V * gate.unsqueeze(0)                 # (N, B, T, D)
 
@@ -381,7 +381,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
-        # AttnRes components — one (proj, norm) per sublayer for Q/K routing.
+        # AttnRes components - one (proj, norm) per sublayer for Q/K routing.
         self.attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
         self.attn_res_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -397,7 +397,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         self.gate_type = getattr(config, "attnres_gate_type", "bias")
 
         if self.gate_type == "sigmoid_scalar":
-            # Scalar sigmoid gate: sigmoid(-2) ≈ 0.12 → small initial mixing
+            # Scalar sigmoid gate: sigmoid(-2) ≈ 0.12 -> small initial mixing
             self.attn_res_gate_logit = nn.Parameter(torch.tensor(-2.0))
             self.mlp_res_gate_logit = nn.Parameter(torch.tensor(-2.0))
         elif self.gate_type == "sigmoid_vector":
@@ -419,7 +419,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         # Null source for identity init (fine-tuning)
         self.use_null_source = getattr(config, "attnres_use_null_source", False)
         if self.use_null_source:
-            # Zero-init: softmax gives uniform weight, null contributes zeros → h ≈ partial
+            # Zero-init: softmax gives uniform weight, null contributes zeros -> h ≈ partial
             self.attn_null_source = nn.Parameter(torch.zeros(config.hidden_size))
             self.mlp_null_source = nn.Parameter(torch.zeros(config.hidden_size))
 
@@ -427,7 +427,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         if self.attnres_mode == "pre_gated":
             self.attn_pre_gate = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
             nn.init.zeros_(self.attn_pre_gate.weight)
-            nn.init.constant_(self.attn_pre_gate.bias, 0.0)  # sigmoid(0)=0.5 → pass half
+            nn.init.constant_(self.attn_pre_gate.bias, 0.0)  # sigmoid(0)=0.5 -> pass half
             self.mlp_pre_gate = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
             nn.init.zeros_(self.mlp_pre_gate.weight)
             nn.init.constant_(self.mlp_pre_gate.bias, 0.0)
@@ -607,7 +607,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             mlp_out = self.mlp(self.post_attention_layernorm(h))
             partial_block = partial_block + mlp_out
 
-            # blocks unchanged — model forward handles block delta accumulation
+            # blocks unchanged - model forward handles block delta accumulation
             return blocks, partial_block
 
         if self.attnres_mode == "delta_block_v":
@@ -615,7 +615,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             attn_null = self.attn_null_source if self.use_null_source else None
             mlp_null = self.mlp_null_source if self.use_null_source else None
 
-            # Attention sublayer — two delta_attn_res calls (QK and V)
+            # Attention sublayer - two delta_attn_res calls (QK and V)
             h_qk = delta_attn_res(blocks, partial_block,
                                    self.attn_res_proj, self.attn_res_norm, attn_null)
             h_v = delta_attn_res(blocks, partial_block,
@@ -636,7 +636,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             )
             partial_block = partial_block + attn_out
 
-            # MLP sublayer — single routing
+            # MLP sublayer - single routing
             h_attn = delta_attn_res(blocks, partial_block,
                                      self.mlp_res_proj, self.mlp_res_norm, mlp_null)
             h = self._apply_gate(partial_block, h_attn, "mlp")
@@ -644,7 +644,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             mlp_out = self.mlp(self.post_attention_layernorm(h))
             partial_block = partial_block + mlp_out
 
-            # blocks unchanged — model forward handles block delta accumulation
+            # blocks unchanged - model forward handles block delta accumulation
             return blocks, partial_block
 
         if self.attnres_mode == "delta":
@@ -701,7 +701,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             attn_null = self.attn_null_source if self.use_null_source else None
             mlp_null = self.mlp_null_source if self.use_null_source else None
 
-            # Attention sublayer — two parallel delta_attn_res calls
+            # Attention sublayer - two parallel delta_attn_res calls
             h_qk = delta_attn_res(blocks, partial_block,
                                    self.attn_res_proj, self.attn_res_norm, attn_null)
             h_v = delta_attn_res(blocks, partial_block,
@@ -723,7 +723,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             partial_block = partial_block + attn_out
             blocks = blocks + [attn_out]
 
-            # MLP sublayer (same as delta — no V-stream decoupling needed)
+            # MLP sublayer (same as delta - no V-stream decoupling needed)
             h_attn = delta_attn_res(blocks, partial_block,
                                      self.mlp_res_proj, self.mlp_res_norm, mlp_null)
             h = self._apply_gate(partial_block, h_attn, "mlp")
@@ -738,7 +738,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             # ---- Full-V mode: cumulative states + per-stream V routing ----
             # Like full mode but with independent V-stream depth routing.
 
-            # Attention sublayer — two block_attn_res calls (QK and V)
+            # Attention sublayer - two block_attn_res calls (QK and V)
             h_qk = block_attn_res(blocks, partial_block,
                                    self.attn_res_proj, self.attn_res_norm)
             h_v = block_attn_res(blocks, partial_block,
@@ -760,7 +760,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             partial_block = partial_block + attn_out
             blocks = blocks + [partial_block]  # cumulative state after attn
 
-            # MLP sublayer — single routing (same as full mode)
+            # MLP sublayer - single routing (same as full mode)
             h_attn = block_attn_res(blocks, partial_block,
                                      self.mlp_res_proj, self.mlp_res_norm)
             h = self._apply_gate(partial_block, h_attn, "mlp")
@@ -777,7 +777,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             # At new-block start: store old partial in blocks, reset partial.
             # partial_block tracks intra-block accumulation only.
 
-            # Attention sublayer — uses old partial
+            # Attention sublayer - uses old partial
             if entropy_accum is not None:
                 h_attn, ent = block_attn_res(blocks, partial_block,
                                              self.attn_res_proj, self.attn_res_norm, return_entropy=True)
@@ -821,7 +821,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         if self.attnres_mode == "block_v":
             # ---- Block-V mode: block mode + per-stream V routing ----
 
-            # Attention sublayer — two block_attn_res calls (QK and V)
+            # Attention sublayer - two block_attn_res calls (QK and V)
             h_qk = block_attn_res(blocks, partial_block,
                                    self.attn_res_proj, self.attn_res_norm)
             h_v = block_attn_res(blocks, partial_block,
@@ -847,7 +847,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             )
             partial_block = partial_block + attn_out
 
-            # MLP sublayer — single routing (same as block mode)
+            # MLP sublayer - single routing (same as block mode)
             h_attn = block_attn_res(blocks, partial_block,
                                      self.mlp_res_proj, self.mlp_res_norm)
             h = self._apply_gate(partial_block, h_attn, "mlp")

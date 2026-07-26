@@ -85,7 +85,7 @@ def block_attn_res(
     K = norm(V)
 
     # Scalar logit per (block, batch, token) via the single learned query
-    # proj.weight shape: (1, D) → squeeze to (D,)
+    # proj.weight shape: (1, D) -> squeeze to (D,)
     query = proj.weight.view(-1)                              # (D,)
     logits = torch.einsum("d, n b t d -> n b t", query, K)   # (N+1, B, T)
 
@@ -111,7 +111,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
       • accumulates output into partial_block (not a running total)
       • returns updated (blocks, partial_block)
 
-    Each layer owns two (proj, norm) pairs — one for the attention sublayer
+    Each layer owns two (proj, norm) pairs - one for the attention sublayer
     and one for the MLP sublayer.
     """
 
@@ -127,7 +127,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
-        # AttnRes components — one pseudo-query Linear(d, 1) per sublayer.
+        # AttnRes components - one pseudo-query Linear(d, 1) per sublayer.
         # We use bias=False and only rely on weight (d,) as the query vector.
         self.attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
         self.attn_res_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -27,6 +27,10 @@ Usage:
     # Hindi instruction following
     python eval_downstream.py --model_path Qwen/Qwen3-0.6B --mode baseline \
         --tasks ifeval_hi --apply_chat_template
+
+    # Hindi math reasoning and function calling
+    python eval_downstream.py --model_path Qwen/Qwen3-0.6B --mode baseline \
+        --tasks gsm8khi,bfcl_hi --apply_chat_template
 """
 
 import argparse
@@ -52,12 +56,15 @@ PAPER_TASKS = [
     "lambada_openai",
     "milu",
     "ifeval_hi",
+    "gsm8khi",
+    "bfcl_hi",
 ]
 
 # Concise task set for quick sanity checks
 QUICK_TASKS = ["hellaswag", "arc_easy", "piqa", "lambada_openai"]
 
-CUSTOM_TASK_PREFIXES = ("milu", "ifeval_hi", "ifevalhi")
+CUSTOM_TASK_PREFIXES = ("milu", "ifeval_hi", "ifevalhi", "gsm8khi")
+BFCL_TASK_NAMES = frozenset({"bfcl_hi", "bfclhi"})
 
 
 def parse_args():
@@ -80,6 +87,10 @@ def parse_args():
                    help="Limit number of examples per task (for debugging)")
     p.add_argument("--apply_chat_template", action="store_true",
                    help="Apply the tokenizer chat template (recommended for instruction models)")
+    p.add_argument("--bfcl_categories", default="all",
+                   help="Comma-separated BFCL-Hi categories, or 'all'")
+    p.add_argument("--bfcl_max_new_tokens", type=int, default=1024,
+                   help="Maximum generated tokens for each BFCL-Hi example")
     return p.parse_args()
 
 
@@ -271,7 +282,7 @@ def eval_manual(model, tokenizer, tasks, device, limit=None):
             sentence = sample["sentence"]
             opt1 = sample["option1"]
             opt2 = sample["option2"]
-            label = int(sample["answer"]) - 1  # 1-indexed → 0-indexed
+            label = int(sample["answer"]) - 1  # 1-indexed -> 0-indexed
             scores = []
             for opt in [opt1, opt2]:
                 text = sentence.replace("_", opt)
@@ -363,39 +374,84 @@ def main():
     print(f"Tasks: {', '.join(tasks)}")
     print()
 
-    # Try lm-eval-harness first, fall back to manual
-    try:
-        import lm_eval
-        print("Using lm-evaluation-harness...")
-        results = eval_with_lm_eval(
-            model, tokenizer, tasks, args.num_fewshot,
-            args.batch_size, args.device, args.limit,
-            args.apply_chat_template)
+    bfcl_requested = any(task in BFCL_TASK_NAMES for task in tasks)
+    lm_eval_tasks = [task for task in tasks if task not in BFCL_TASK_NAMES]
+    combined_results = {}
 
-        # Print summary
-        print("\n" + "=" * 60)
-        print(f"RESULTS ({args.mode}) - {args.model_path}")
-        print("=" * 60)
-        for task_name, task_results in results["results"].items():
-            metrics = {k: v for k, v in task_results.items()
-                       if not k.startswith("_") and isinstance(v, (int, float))}
-            for metric, value in metrics.items():
-                print(f"  {task_name}/{metric}: {value:.4f}")
-
-    except ImportError:
-        unsupported = [
-            task for task in tasks
-            if task.startswith(CUSTOM_TASK_PREFIXES) or task == "milu"
-        ]
-        if unsupported:
-            raise RuntimeError(
-                "lm-eval is required for the custom benchmark tasks: "
-                + ", ".join(unsupported)
+    if lm_eval_tasks:
+        # Try lm-eval-harness first, fall back to manual.
+        try:
+            import lm_eval
+            print("Using lm-evaluation-harness...")
+            lm_eval_results = eval_with_lm_eval(
+                model, tokenizer, lm_eval_tasks, args.num_fewshot,
+                args.batch_size, args.device, args.limit,
+                args.apply_chat_template)
+            combined_results.update(lm_eval_results["results"])
+        except ImportError:
+            unsupported = [
+                task for task in lm_eval_tasks
+                if task.startswith(CUSTOM_TASK_PREFIXES) or task == "milu"
+            ]
+            if unsupported:
+                raise RuntimeError(
+                    "lm-eval is required for the custom benchmark tasks: "
+                    + ", ".join(unsupported)
+                )
+            print("lm-eval not installed, using manual evaluation...")
+            print("(Install with: pip install lm-eval>=0.4.0)")
+            print()
+            combined_results.update(
+                eval_manual(
+                    model, tokenizer, lm_eval_tasks, args.device, args.limit
+                )
             )
-        print("lm-eval not installed, using manual evaluation...")
-        print("(Install with: pip install lm-eval>=0.4.0)")
-        print()
-        results = {"results": eval_manual(model, tokenizer, tasks, args.device, args.limit)}
+
+    if bfcl_requested:
+        from eval_tasks.bfcl_hi.evaluator import (
+            DEFAULT_CATEGORIES,
+            evaluate_bfcl_hi,
+        )
+
+        if args.bfcl_categories == "all":
+            categories = DEFAULT_CATEGORIES
+        else:
+            categories = tuple(
+                category.strip()
+                for category in args.bfcl_categories.split(",")
+                if category.strip()
+            )
+        print("Using the BFCL-Hi tool-aware evaluator...")
+        combined_results["bfcl_hi"] = evaluate_bfcl_hi(
+            model,
+            tokenizer,
+            args.device,
+            categories=categories,
+            limit=args.limit,
+            max_new_tokens=args.bfcl_max_new_tokens,
+        )
+
+    results = {"results": combined_results}
+
+    print("\n" + "=" * 60)
+    print(f"RESULTS ({args.mode}) - {args.model_path}")
+    print("=" * 60)
+    for task_name, task_results in combined_results.items():
+        metrics = {
+            key: value for key, value in task_results.items()
+            if not key.startswith("_") and isinstance(value, (int, float))
+        }
+        for metric, value in metrics.items():
+            if metric == "samples":
+                print(f"  {task_name}/{metric}: {value}")
+            else:
+                print(f"  {task_name}/{metric}: {value:.4f}")
+        if task_name == "bfcl_hi":
+            for category, category_metrics in task_results["categories"].items():
+                print(
+                    f"  {task_name}/{category}/accuracy: "
+                    f"{category_metrics['accuracy']:.4f}"
+                )
 
     # Save results
     output_dir = args.output_dir or os.path.dirname(args.model_path)
@@ -411,7 +467,7 @@ def main():
                 "apply_chat_template": args.apply_chat_template,
                 "results": results.get("results", results),
             }, f, indent=2, default=str)
-        print(f"\nResults saved → {out_file}")
+        print(f"\nResults saved -> {out_file}")
 
 
 if __name__ == "__main__":

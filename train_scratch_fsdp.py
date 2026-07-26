@@ -375,7 +375,7 @@ def main():
             ckpt_dir = os.path.join(args.out_dir, f"step-{global_step}")
             save_fsdp_checkpoint(model, tokenizer, ckpt_dir, rank)
             if is_main:
-                print(f"Saved checkpoint → {ckpt_dir}")
+                print(f"Saved checkpoint -> {ckpt_dir}")
             dist.barrier()
 
         if args.eval_every > 0 and global_step % args.eval_every == 0 and val_iter is not None:
@@ -402,7 +402,7 @@ def main():
     final_dir = os.path.join(args.out_dir, "final")
     save_fsdp_checkpoint(model, tokenizer, final_dir, rank)
     if is_main:
-        print(f"Training done. Final model → {final_dir}")
+        print(f"Training done. Final model -> {final_dir}")
         if use_wandb:
             import wandb
             wandb.finish()
