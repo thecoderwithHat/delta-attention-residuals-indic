@@ -55,6 +55,24 @@ torchrun --standalone --nproc_per_node=8 train_scratch.py \
     --dataset HuggingFaceFW/fineweb-2 --dataset_name hrv_Latn
 ```
 
+### Routing sharpness plot
+
+Compare the mean maximum depth-routing probability at each layer using two
+trained checkpoints:
+
+```bash
+python plot_routing_sharpness.py \
+    --attnres-checkpoint output/attnres/final \
+    --delta-checkpoint output/delta/final \
+    --text-file evaluation_text.txt \
+    --output routing_sharpness.png
+```
+
+The script averages over tokens, input samples, and the attention and MLP
+routing decisions in each layer. It saves the plotted values to a CSV file
+next to the image. Use an AttnRes `block` or `full` checkpoint and a
+Delta-AttnRes `delta` checkpoint.
+
 ### Training from scratch (7B+, FSDP)
 
 ```bash

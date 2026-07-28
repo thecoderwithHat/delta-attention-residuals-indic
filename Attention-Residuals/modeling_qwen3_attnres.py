@@ -166,6 +166,20 @@ def _block_attn_res_kernel_with_entropy(
     return h, entropy
 
 
+def _block_attn_res_kernel_with_max_weight(
+    V: torch.Tensor,
+    query: torch.Tensor,
+    norm: Qwen3RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the routed state and mean maximum source probability."""
+    K = norm(V)
+    logits = torch.einsum("d, n b t d -> n b t", query, K)
+    weights = logits.softmax(dim=0)
+    h = torch.einsum("n b t, n b t d -> b t d", weights, V)
+    max_weight = weights.amax(dim=0).mean()
+    return h, max_weight
+
+
 # Compiled versions (created lazily via enable_compile())
 _compiled_block_kernel = None
 _compiled_block_kernel_entropy = None
@@ -193,16 +207,25 @@ def block_attn_res(
     proj: nn.Linear,              # learned pseudo-query weight  (d,)
     norm: Qwen3RMSNorm,           # RMSNorm applied to keys before scoring
     return_entropy: bool = False, # if True, also return mean entropy of softmax weights
+    return_max_weight: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Attend over all block representations + the current partial block.
 
     Returns a [B, T, D] tensor - the attended aggregation of depth history.
-    If return_entropy=True, also returns a scalar entropy value.
+    If return_entropy=True, also returns a scalar entropy value. If
+    return_max_weight=True, also returns the mean maximum source probability.
+    The two statistics cannot be requested in the same call.
     """
     # Stack outside compiled region so torch.compile sees a tensor, not a list
     V = torch.stack(blocks + [partial_block], dim=0)
     query = proj.weight.view(-1)
+
+    if return_entropy and return_max_weight:
+        raise ValueError("Request either entropy or max weight, not both")
+
+    if return_max_weight:
+        return _block_attn_res_kernel_with_max_weight(V, query, norm)
 
     if return_entropy:
         kernel = _compiled_block_kernel_entropy or _block_attn_res_kernel_with_entropy
@@ -242,6 +265,22 @@ def _delta_attn_res_kernel_with_entropy(
     return h, entropy
 
 
+def _delta_attn_res_kernel_with_max_weight(
+    V: torch.Tensor,
+    partial_block: torch.Tensor,
+    query: torch.Tensor,
+    norm: Qwen3RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the routed state and mean maximum source probability."""
+    K = norm(V)
+    logits = torch.einsum("d, n b t d -> n b t", query, K)
+    weights = logits.softmax(dim=0)
+    selected = torch.einsum("n b t, n b t d -> b t d", weights, V)
+    h = partial_block + selected
+    max_weight = weights.amax(dim=0).mean()
+    return h, max_weight
+
+
 def delta_attn_res(
     deltas: list[torch.Tensor],   # previous sublayer outputs (deltas)  [B, T, D] each
     partial_block: torch.Tensor,  # current residual stream  [B, T, D]
@@ -249,6 +288,7 @@ def delta_attn_res(
     norm: Qwen3RMSNorm,
     null_source: nn.Parameter | None = None,  # learnable null token for identity init
     return_entropy: bool = False,
+    return_max_weight: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Attend over previous sublayer deltas and add selected information to
@@ -262,6 +302,10 @@ def delta_attn_res(
         init: null_source=0, proj=0 -> uniform weights -> Σα·v ≈ 0 -> h ≈ partial_block
     """
     if not deltas and null_source is None:
+        if return_max_weight:
+            return partial_block, torch.tensor(
+                float("nan"), device=partial_block.device
+            )
         if return_entropy:
             return partial_block, torch.tensor(0.0, device=partial_block.device)
         return partial_block
@@ -273,6 +317,10 @@ def delta_attn_res(
         sources = [null_expanded] + sources
 
     if not sources:
+        if return_max_weight:
+            return partial_block, torch.tensor(
+                float("nan"), device=partial_block.device
+            )
         if return_entropy:
             return partial_block, torch.tensor(0.0, device=partial_block.device)
         return partial_block
@@ -280,6 +328,14 @@ def delta_attn_res(
     # Stack outside compiled region
     V = torch.stack(sources, dim=0)
     query = proj.weight.view(-1)
+
+    if return_entropy and return_max_weight:
+        raise ValueError("Request either entropy or max weight, not both")
+
+    if return_max_weight:
+        return _delta_attn_res_kernel_with_max_weight(
+            V, partial_block, query, norm
+        )
 
     if return_entropy:
         kernel = _compiled_delta_kernel_entropy or _delta_attn_res_kernel_with_entropy
@@ -477,6 +533,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         **kwargs,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
         entropy_accum = kwargs.pop("entropy_accum", None)
+        routing_max_accum = kwargs.pop("routing_max_accum", None)
 
         if self.attnres_mode == "pre_gated":
             # ---- Pre-gated delta: gate sources BEFORE softmax ----
@@ -653,7 +710,13 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             mlp_null = self.mlp_null_source if self.use_null_source else None
 
             # Attention sublayer
-            if entropy_accum is not None:
+            if routing_max_accum is not None:
+                h_attn, max_weight = delta_attn_res(
+                    blocks, partial_block, self.attn_res_proj,
+                    self.attn_res_norm, attn_null, return_max_weight=True,
+                )
+                routing_max_accum.append(max_weight)
+            elif entropy_accum is not None:
                 h_attn, ent = delta_attn_res(blocks, partial_block,
                                              self.attn_res_proj, self.attn_res_norm, attn_null,
                                              return_entropy=True)
@@ -678,7 +741,13 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             blocks = blocks + [attn_out]
 
             # MLP sublayer
-            if entropy_accum is not None:
+            if routing_max_accum is not None:
+                h_attn, max_weight = delta_attn_res(
+                    blocks, partial_block, self.mlp_res_proj,
+                    self.mlp_res_norm, mlp_null, return_max_weight=True,
+                )
+                routing_max_accum.append(max_weight)
+            elif entropy_accum is not None:
                 h_attn, ent = delta_attn_res(blocks, partial_block,
                                              self.mlp_res_proj, self.mlp_res_norm, mlp_null,
                                              return_entropy=True)
@@ -778,7 +847,13 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             # partial_block tracks intra-block accumulation only.
 
             # Attention sublayer - uses old partial
-            if entropy_accum is not None:
+            if routing_max_accum is not None:
+                h_attn, max_weight = block_attn_res(
+                    blocks, partial_block, self.attn_res_proj,
+                    self.attn_res_norm, return_max_weight=True,
+                )
+                routing_max_accum.append(max_weight)
+            elif entropy_accum is not None:
                 h_attn, ent = block_attn_res(blocks, partial_block,
                                              self.attn_res_proj, self.attn_res_norm, return_entropy=True)
                 entropy_accum.append(ent)
@@ -804,7 +879,13 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             partial_block = partial_block + attn_out
 
             # MLP sublayer
-            if entropy_accum is not None:
+            if routing_max_accum is not None:
+                h_attn, max_weight = block_attn_res(
+                    blocks, partial_block, self.mlp_res_proj,
+                    self.mlp_res_norm, return_max_weight=True,
+                )
+                routing_max_accum.append(max_weight)
+            elif entropy_accum is not None:
                 h_attn, ent = block_attn_res(blocks, partial_block,
                                              self.mlp_res_proj, self.mlp_res_norm, return_entropy=True)
                 entropy_accum.append(ent)
@@ -927,8 +1008,15 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         # ---- Full mode (delta sources + replacement routing + final routing) ----
 
         # Attention sublayer
-        h_attn = block_attn_res(blocks, partial_block,
-                                self.attn_res_proj, self.attn_res_norm)
+        if routing_max_accum is not None:
+            h_attn, max_weight = block_attn_res(
+                blocks, partial_block, self.attn_res_proj,
+                self.attn_res_norm, return_max_weight=True,
+            )
+            routing_max_accum.append(max_weight)
+        else:
+            h_attn = block_attn_res(blocks, partial_block,
+                                    self.attn_res_proj, self.attn_res_norm)
         h = self._apply_gate(partial_block, h_attn, "attn")
 
         attn_out, _ = self.self_attn(
@@ -944,8 +1032,15 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         partial_block = attn_out
 
         # MLP sublayer
-        h_attn = block_attn_res(blocks, partial_block,
-                                self.mlp_res_proj, self.mlp_res_norm)
+        if routing_max_accum is not None:
+            h_attn, max_weight = block_attn_res(
+                blocks, partial_block, self.mlp_res_proj,
+                self.mlp_res_norm, return_max_weight=True,
+            )
+            routing_max_accum.append(max_weight)
+        else:
+            h_attn = block_attn_res(blocks, partial_block,
+                                    self.mlp_res_proj, self.mlp_res_norm)
         h = self._apply_gate(partial_block, h_attn, "mlp")
 
         mlp_out = self.mlp(self.post_attention_layernorm(h))
@@ -1074,6 +1169,8 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
         # Entropy accumulation for auxiliary loss
         entropy_lambda = kwargs.pop("entropy_lambda", 0.0)
         entropy_accum = [] if entropy_lambda > 0 else None
+        return_routing_max = kwargs.pop("return_routing_max", False)
+        routing_max_accum = [] if return_routing_max else None
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
@@ -1099,6 +1196,7 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     entropy_accum=entropy_accum,
+                    routing_max_accum=routing_max_accum,
                 )
 
             # delta_block: accumulate block deltas at block boundaries
@@ -1128,6 +1226,10 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
         )
         # Attach entropy as extra attribute
         out.attnres_entropy = attnres_entropy
+        out.routing_max_weights = (
+            torch.stack(routing_max_accum).view(-1, 2).nanmean(dim=1)
+            if routing_max_accum else None
+        )
         return out
 
 
@@ -1188,9 +1290,10 @@ class Qwen3AttnResForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 # Subtract entropy (negative because we want to maximize it)
                 loss = loss - entropy_lambda * attnres_entropy
 
-        return CausalLMOutputWithPast(
+        out = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
         )
-
+        out.routing_max_weights = getattr(outputs, "routing_max_weights", None)
+        return out
