@@ -16,10 +16,12 @@ Usage:
 """
 
 import argparse
+import itertools
 import math
 import os
 import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -63,6 +65,13 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=500)
     p.add_argument("--max_norm", type=float, default=1.0)
     p.add_argument("--save_every", type=int, default=2000)
+    p.add_argument(
+        "--resume", "--resume_from_checkpoint", dest="resume", nargs="?",
+        const="latest", default=None, metavar="CHECKPOINT",
+        help=("Resume model, optimizer, scheduler, RNG, and data-stream progress. "
+              "Pass a checkpoint directory, or omit the value to use the latest "
+              "step-* checkpoint in --out_dir."),
+    )
     p.add_argument("--eval_every", type=int, default=500)
     p.add_argument("--eval_steps", type=int, default=50)
     p.add_argument("--log_every", type=int, default=10)
@@ -75,6 +84,8 @@ def parse_args():
                    help="Enable torch.compile on AttnRes kernels")
     p.add_argument("--compile_model", action="store_true",
                    help="torch.compile the entire model (fuses attention+MLP+routing)")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Trade compute for lower activation memory usage")
     p.add_argument("--freeze_base", action="store_true",
                    help="Freeze all pretrained params, only train AttnRes (like LoRA)")
     return p.parse_args()
@@ -86,6 +97,123 @@ def cosine_with_warmup(step, warmup, total, lr_min_ratio):
     progress = (step - warmup) / max(1, total - warmup)
     cos = 0.5 * (1 + math.cos(math.pi * progress))
     return lr_min_ratio + (1 - lr_min_ratio) * cos
+
+
+def resolve_resume_checkpoint(resume, out_dir):
+    """Resolve --resume, including its no-argument `latest` form."""
+    if resume is None:
+        return None
+
+    if resume != "latest":
+        checkpoint_dir = Path(resume).expanduser()
+    else:
+        candidates = []
+        for path in Path(out_dir).glob("step-*"):
+            try:
+                step = int(path.name.removeprefix("step-"))
+            except ValueError:
+                continue
+            if (path / "training_state.pt").is_file():
+                candidates.append((step, path))
+        if not candidates:
+            raise FileNotFoundError(
+                f"--resume was requested, but no resumable step-* checkpoints "
+                f"were found in {out_dir}"
+            )
+        checkpoint_dir = max(candidates, key=lambda item: item[0])[1]
+
+    state_path = checkpoint_dir / "training_state.pt"
+    if not checkpoint_dir.is_dir() or not state_path.is_file():
+        raise FileNotFoundError(
+            f"{checkpoint_dir} is not a resumable checkpoint "
+            f"(missing training_state.pt)"
+        )
+    return str(checkpoint_dir)
+
+
+def unwrap_model(model):
+    """Remove DDP and torch.compile wrappers before Hugging Face serialization."""
+    while True:
+        if isinstance(model, DDP):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            return model
+
+
+def save_checkpoint(model, optimizer, scheduler, tokenizer, save_dir,
+                    global_step, chunks_consumed, args, rank, world_size):
+    """Save an HF model plus all state needed for an exact DDP restart."""
+    if rank == 0:
+        os.makedirs(save_dir, exist_ok=True)
+    dist.barrier()
+
+    # Each rank has a distinct dropout RNG stream.
+    rng_state = {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state(),
+    }
+    torch.save(rng_state, os.path.join(save_dir, f"rng_state_rank-{rank}.pt"))
+
+    if rank == 0:
+        unwrapped = unwrap_model(model)
+        unwrapped.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+        state = {
+            "checkpoint_version": 1,
+            "global_step": global_step,
+            "chunks_consumed": chunks_consumed,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "world_size": world_size,
+            "training_args": {
+                key: getattr(args, key) for key in (
+                    "mode", "freeze_base", "lr_attnres", "lr", "lr_min",
+                    "warmup", "batch_size", "grad_accum", "seq_len",
+                    "dataset", "dataset_name", "seed",
+                )
+            },
+        }
+        # Write the marker/state last so --resume latest ignores partial saves.
+        state_tmp = os.path.join(save_dir, "training_state.pt.tmp")
+        torch.save(state, state_tmp)
+        os.replace(state_tmp, os.path.join(save_dir, "training_state.pt"))
+    dist.barrier()
+
+
+def load_training_state(checkpoint_dir, optimizer, scheduler, args,
+                        rank, world_size):
+    state = torch.load(
+        os.path.join(checkpoint_dir, "training_state.pt"),
+        map_location="cpu", weights_only=True,
+    )
+    if state["world_size"] != world_size:
+        raise ValueError(
+            "Resuming the streaming dataset requires the same world size: "
+            f"checkpoint={state['world_size']}, current={world_size}"
+        )
+    if state.get("checkpoint_version") != 1:
+        raise ValueError(
+            f"Unsupported checkpoint version: {state.get('checkpoint_version')!r}"
+        )
+    for key, saved_value in state["training_args"].items():
+        if saved_value != getattr(args, key):
+            raise ValueError(
+                f"Checkpoint was created with {key}={saved_value!r}, "
+                f"but the current value is {getattr(args, key)!r}"
+            )
+
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+
+    rng_path = os.path.join(checkpoint_dir, f"rng_state_rank-{rank}.pt")
+    if not os.path.isfile(rng_path):
+        raise FileNotFoundError(f"Missing per-rank RNG state: {rng_path}")
+    rng_state = torch.load(rng_path, map_location="cpu", weights_only=True)
+    torch.set_rng_state(rng_state["torch"])
+    torch.cuda.set_rng_state(rng_state["cuda"], device=torch.cuda.current_device())
+    return state
 
 
 def token_stream(dataset_name, config_name, tokenizer, seq_len, rank, world_size, seed, split="train"):
@@ -145,6 +273,13 @@ def eval_validation(model, dataset_name, config_name, tokenizer, seq_len,
 
 def build_model(args, device):
     """Load pretrained model and optionally inject AttnRes parameters."""
+    if args.resume is not None:
+        model_cls = (Qwen3ForCausalLM if args.mode == "baseline"
+                     else Qwen3AttnResForCausalLM)
+        return model_cls.from_pretrained(
+            args.resume, torch_dtype=torch.bfloat16,
+        ).to(device)
+
     if args.mode == "baseline":
         model = Qwen3ForCausalLM.from_pretrained(
             args.pretrained, torch_dtype=torch.bfloat16)
@@ -191,6 +326,7 @@ def main():
         args.run_name = f"ft-{pretrained_short}-{args.mode}-{args.steps//1000}k"
     if args.out_dir is None:
         args.out_dir = f"./output/ft-{pretrained_short}-{args.mode}-{args.steps//1000}k"
+    args.resume = resolve_resume_checkpoint(args.resume, args.out_dir)
 
     # ── distributed ──
     dist.init_process_group("nccl")
@@ -216,7 +352,10 @@ def main():
 
     # ── model ──
     if is_main:
-        print(f"Loading pretrained {args.pretrained}, injecting {args.mode} AttnRes...")
+        if args.resume:
+            print(f"Resuming from {args.resume}")
+        else:
+            print(f"Loading pretrained {args.pretrained}, injecting {args.mode} AttnRes...")
 
     model = build_model(args, device)
 
@@ -250,6 +389,11 @@ def main():
         if is_main:
             print(f"Freeze base: {n_frozen/1e6:.1f}M frozen, {n_trainable/1e3:.1f}K trainable "
                   f"({n_trainable/(n_frozen+n_trainable)*100:.3f}%)")
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        if is_main:
+            print("Gradient checkpointing enabled")
 
     # torch.compile the full model before DDP wrapping.
     # Gives ~2.5-2.9x throughput improvement for all modes.
@@ -300,7 +444,7 @@ def main():
         )
 
     # ── data ──
-    tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
+    tokenizer = AutoTokenizer.from_pretrained(args.resume or args.pretrained)
     stream = token_stream(args.dataset, args.dataset_name, tokenizer,
                           args.seq_len, rank, world_size, args.seed)
 
@@ -310,6 +454,20 @@ def main():
     optimizer.zero_grad()
 
     global_step = 0
+    chunks_consumed = 0
+    if args.resume:
+        training_state = load_training_state(
+            args.resume, optimizer, scheduler, args, rank, world_size,
+        )
+        global_step = training_state["global_step"]
+        chunks_consumed = training_state["chunks_consumed"]
+        stream = itertools.islice(stream, chunks_consumed, None)
+        if is_main:
+            print(f"Restored training at step {global_step}; "
+                  f"skipping {chunks_consumed} consumed stream chunks per rank")
+        if global_step >= args.steps:
+            # Avoid replaying the stream merely to discover that training is done.
+            stream = ()
     accum_step = 0
     accum_loss = 0.0
     t0 = time.time()
@@ -320,6 +478,7 @@ def main():
         if global_step >= args.steps:
             break
 
+        chunks_consumed += 1
         batch_buf.append(chunk[:-1])
         if len(batch_buf) < args.batch_size:
             continue
@@ -383,16 +542,21 @@ def main():
                 import wandb
                 wandb.log({"val/loss": val_loss, "val/ppl": val_ppl}, step=global_step)
 
-        if is_main and global_step % args.save_every == 0:
+        if args.save_every > 0 and global_step % args.save_every == 0:
             ckpt_dir = os.path.join(args.out_dir, f"step-{global_step}")
-            model.module.save_pretrained(ckpt_dir)
-            tokenizer.save_pretrained(ckpt_dir)
-            print(f"Saved checkpoint -> {ckpt_dir}")
+            save_checkpoint(
+                model, optimizer, scheduler, tokenizer, ckpt_dir,
+                global_step, chunks_consumed, args, rank, world_size,
+            )
+            if is_main:
+                print(f"Saved checkpoint -> {ckpt_dir}")
 
+    final_dir = os.path.join(args.out_dir, "final")
+    save_checkpoint(
+        model, optimizer, scheduler, tokenizer, final_dir,
+        global_step, chunks_consumed, args, rank, world_size,
+    )
     if is_main:
-        final_dir = os.path.join(args.out_dir, "final")
-        model.module.save_pretrained(final_dir)
-        tokenizer.save_pretrained(final_dir)
         print(f"Training done. Final model -> {final_dir}")
         if use_wandb:
             import wandb
