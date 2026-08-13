@@ -19,6 +19,7 @@ import argparse
 import itertools
 import math
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -131,6 +132,18 @@ def resolve_resume_checkpoint(resume, out_dir):
     return str(checkpoint_dir)
 
 
+def cleanup_intermediate_checkpoints(out_dir):
+    """Delete numbered step checkpoints after a successful final save."""
+    removed = []
+    for path in Path(out_dir).glob("step-*"):
+        step = path.name.removeprefix("step-")
+        if not step.isdigit() or not path.is_dir() or path.is_symlink():
+            continue
+        shutil.rmtree(path)
+        removed.append(path)
+    return sorted(removed, key=lambda path: int(path.name.removeprefix("step-")))
+
+
 def unwrap_model(model):
     """Remove DDP and torch.compile wrappers before Hugging Face serialization."""
     while True:
@@ -180,6 +193,18 @@ def save_checkpoint(model, optimizer, scheduler, tokenizer, save_dir,
         torch.save(state, state_tmp)
         os.replace(state_tmp, os.path.join(save_dir, "training_state.pt"))
     dist.barrier()
+
+
+def save_final_checkpoint(model, optimizer, scheduler, tokenizer, out_dir,
+                          global_step, chunks_consumed, args, rank, world_size):
+    """Save the final checkpoint, then remove intermediate checkpoints on rank 0."""
+    final_dir = os.path.join(out_dir, "final")
+    save_checkpoint(
+        model, optimizer, scheduler, tokenizer, final_dir,
+        global_step, chunks_consumed, args, rank, world_size,
+    )
+    removed = cleanup_intermediate_checkpoints(out_dir) if rank == 0 else []
+    return final_dir, removed
 
 
 def load_training_state(checkpoint_dir, optimizer, scheduler, args,
@@ -551,12 +576,14 @@ def main():
             if is_main:
                 print(f"Saved checkpoint -> {ckpt_dir}")
 
-    final_dir = os.path.join(args.out_dir, "final")
-    save_checkpoint(
-        model, optimizer, scheduler, tokenizer, final_dir,
+    final_dir, removed_checkpoints = save_final_checkpoint(
+        model, optimizer, scheduler, tokenizer, args.out_dir,
         global_step, chunks_consumed, args, rank, world_size,
     )
     if is_main:
+        if removed_checkpoints:
+            removed_names = ", ".join(path.name for path in removed_checkpoints)
+            print(f"Removed intermediate checkpoints: {removed_names}")
         print(f"Training done. Final model -> {final_dir}")
         if use_wandb:
             import wandb
