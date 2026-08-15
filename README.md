@@ -57,8 +57,8 @@ torchrun --standalone --nproc_per_node=8 train_scratch.py \
 
 ### Routing sharpness plot
 
-Compare the mean maximum depth-routing probability at each layer using two
-trained checkpoints:
+The descriptive plot compares the mean maximum depth-routing probability at
+each layer using two trained checkpoints:
 
 ```bash
 python plot_routing_sharpness.py \
@@ -72,6 +72,35 @@ The script averages over tokens, input samples, and the attention and MLP
 routing decisions in each layer. It saves the plotted values to a CSV file
 next to the image. Use an AttnRes `block` or `full` checkpoint and a
 Delta-AttnRes `delta` checkpoint.
+
+This cross-checkpoint comparison is correlational. To test whether routing
+sharpness itself affects quality, run the within-checkpoint logit-scale
+intervention:
+
+```bash
+python test_routing_causality.py \
+    --checkpoint AttnRes=output/attnres/final \
+    --checkpoint Delta-AttnRes=output/delta/final \
+    --text-file evaluation_text.txt \
+    --logit-scales 0.5 0.75 1 1.5 2 \
+    --output routing_causal_intervention.png
+```
+
+The intervention multiplies only the learned Q/K and MLP depth-routing logits.
+Values above `1` sharpen their softmax distributions and values below `1`
+flatten them; the learned scoring directions and all other parameters remain
+fixed. The script measures the achieved mean maximum weight and next-token
+NLL/perplexity on the same examples, then reports paired sample-bootstrap
+confidence intervals for the NLL change relative to the untouched `1x`
+checkpoint. Use a held-out text file with many independent documents for
+meaningful intervals. Supported modes are `block`, `full`, `delta`, and
+`delta_block`.
+
+Flattening that reliably hurts while moderate sharpening reliably helps is
+evidence for a local causal effect of sharpness in that checkpoint. If both
+directions hurt, the checkpoint is instead calibrated near its learned routing
+temperature; that result does not support the stronger claim that sharpness by
+itself explains the quality gap between architectures.
 
 ### Training from scratch (7B+, FSDP)
 

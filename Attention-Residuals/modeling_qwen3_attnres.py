@@ -621,7 +621,13 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             mlp_null = self.mlp_null_source if self.use_null_source else None
 
             # Attention sublayer
-            if entropy_accum is not None:
+            if routing_max_accum is not None:
+                h_attn, max_weight = delta_attn_res(
+                    blocks, partial_block, self.attn_res_proj,
+                    self.attn_res_norm, attn_null, return_max_weight=True,
+                )
+                routing_max_accum.append(max_weight)
+            elif entropy_accum is not None:
                 h_attn, ent = delta_attn_res(blocks, partial_block,
                                              self.attn_res_proj, self.attn_res_norm, attn_null,
                                              return_entropy=True)
@@ -651,7 +657,13 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             partial_block = partial_block + attn_out
 
             # MLP sublayer
-            if entropy_accum is not None:
+            if routing_max_accum is not None:
+                h_attn, max_weight = delta_attn_res(
+                    blocks, partial_block, self.mlp_res_proj,
+                    self.mlp_res_norm, mlp_null, return_max_weight=True,
+                )
+                routing_max_accum.append(max_weight)
+            elif entropy_accum is not None:
                 h_attn, ent = delta_attn_res(blocks, partial_block,
                                              self.mlp_res_proj, self.mlp_res_norm, mlp_null,
                                              return_entropy=True)
