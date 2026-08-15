@@ -13,7 +13,8 @@ equivalent to standard Qwen3.  During training the bias and proj weights
 co-adapt, letting the model learn cross-block attention.
 """
 
-from collections.abc import Callable
+import random
+from collections.abc import Callable, Iterator
 from typing import Optional
 
 import torch
@@ -180,6 +181,58 @@ def _block_attn_res_kernel_with_max_weight(
     return h, max_weight
 
 
+def _routing_intervention_kernel(
+    V: torch.Tensor,
+    query: torch.Tensor,
+    norm: Qwen3RMSNorm,
+    intervention: str,
+    permutation_seed: int,
+    cached_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Route with an evaluation-only source-selection intervention.
+
+    ``permute`` keeps every learned probability unchanged and applies a
+    deterministic derangement to the source axis. ``uniform`` replaces the
+    probabilities with exactly 1/N. The returned statistics describe the
+    probabilities actually used for routing.
+    """
+    if cached_weights is None:
+        K = norm(V)
+        logits = torch.einsum("d, n b t d -> n b t", query, K)
+        weights = logits.softmax(dim=0)
+    else:
+        weights = cached_weights.to(device=V.device, dtype=V.dtype)
+        if weights.shape != V.shape[:-1]:
+            raise ValueError(
+                "Cached routing weights have shape "
+                f"{tuple(weights.shape)}, expected {tuple(V.shape[:-1])}"
+            )
+
+    if intervention == "uniform":
+        weights = torch.full_like(weights, 1.0 / weights.shape[0])
+    elif intervention == "permute":
+        source_count = V.shape[0]
+        if source_count > 1:
+            # Sattolo's algorithm produces a single cycle, so no source remains
+            # assigned to its original learned probability.
+            permutation = list(range(source_count))
+            generator = random.Random(permutation_seed)
+            for index in range(source_count - 1, 0, -1):
+                swap_index = generator.randrange(index)
+                permutation[index], permutation[swap_index] = (
+                    permutation[swap_index],
+                    permutation[index],
+                )
+            V = V[torch.tensor(permutation, device=V.device)]
+    elif intervention != "capture":
+        raise ValueError(f"Unknown routing intervention: {intervention!r}")
+
+    routed = torch.einsum("n b t, n b t d -> b t d", weights, V)
+    entropy = -(weights * (weights + 1e-8).log()).sum(dim=0).mean()
+    max_weight = weights.amax(dim=0).mean()
+    return routed, entropy, max_weight, weights
+
+
 # Compiled versions (created lazily via enable_compile())
 _compiled_block_kernel = None
 _compiled_block_kernel_entropy = None
@@ -208,6 +261,10 @@ def block_attn_res(
     norm: Qwen3RMSNorm,           # RMSNorm applied to keys before scoring
     return_entropy: bool = False, # if True, also return mean entropy of softmax weights
     return_max_weight: bool = False,
+    routing_intervention: str = "learned",
+    routing_permutation_seed: int = 0,
+    routing_weight_recorder: list[torch.Tensor] | None = None,
+    routing_weight_replay: Iterator[torch.Tensor] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Attend over all block representations + the current partial block.
@@ -223,6 +280,26 @@ def block_attn_res(
 
     if return_entropy and return_max_weight:
         raise ValueError("Request either entropy or max weight, not both")
+
+    if routing_intervention != "learned":
+        try:
+            cached_weights = (
+                next(routing_weight_replay)
+                if routing_weight_replay is not None else None
+            )
+        except StopIteration as error:
+            raise RuntimeError("Routing-weight replay cache is too short") from error
+        h, entropy, max_weight, weights = _routing_intervention_kernel(
+            V, query, norm, routing_intervention, routing_permutation_seed,
+            cached_weights=cached_weights,
+        )
+        if routing_weight_recorder is not None:
+            routing_weight_recorder.append(weights.detach())
+        if return_max_weight:
+            return h, max_weight
+        if return_entropy:
+            return h, entropy
+        return h
 
     if return_max_weight:
         return _block_attn_res_kernel_with_max_weight(V, query, norm)
@@ -289,6 +366,10 @@ def delta_attn_res(
     null_source: nn.Parameter | None = None,  # learnable null token for identity init
     return_entropy: bool = False,
     return_max_weight: bool = False,
+    routing_intervention: str = "learned",
+    routing_permutation_seed: int = 0,
+    routing_weight_recorder: list[torch.Tensor] | None = None,
+    routing_weight_replay: Iterator[torch.Tensor] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Attend over previous sublayer deltas and add selected information to
@@ -331,6 +412,27 @@ def delta_attn_res(
 
     if return_entropy and return_max_weight:
         raise ValueError("Request either entropy or max weight, not both")
+
+    if routing_intervention != "learned":
+        try:
+            cached_weights = (
+                next(routing_weight_replay)
+                if routing_weight_replay is not None else None
+            )
+        except StopIteration as error:
+            raise RuntimeError("Routing-weight replay cache is too short") from error
+        selected, entropy, max_weight, weights = _routing_intervention_kernel(
+            V, query, norm, routing_intervention, routing_permutation_seed,
+            cached_weights=cached_weights,
+        )
+        if routing_weight_recorder is not None:
+            routing_weight_recorder.append(weights.detach())
+        h = partial_block + selected
+        if return_max_weight:
+            return h, max_weight
+        if return_entropy:
+            return h, entropy
+        return h
 
     if return_max_weight:
         return _delta_attn_res_kernel_with_max_weight(
@@ -534,6 +636,22 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
         entropy_accum = kwargs.pop("entropy_accum", None)
         routing_max_accum = kwargs.pop("routing_max_accum", None)
+        routing_intervention = kwargs.pop("routing_intervention", "learned")
+        routing_permutation_seed = kwargs.pop("routing_permutation_seed", 0)
+        routing_weight_recorder = kwargs.pop("routing_weight_recorder", None)
+        routing_weight_replay = kwargs.pop("routing_weight_replay", None)
+        attn_route_kwargs = {
+            "routing_intervention": routing_intervention,
+            "routing_permutation_seed": routing_permutation_seed + 2 * self.layer_idx,
+            "routing_weight_recorder": routing_weight_recorder,
+            "routing_weight_replay": routing_weight_replay,
+        }
+        mlp_route_kwargs = {
+            "routing_intervention": routing_intervention,
+            "routing_permutation_seed": routing_permutation_seed + 2 * self.layer_idx + 1,
+            "routing_weight_recorder": routing_weight_recorder,
+            "routing_weight_replay": routing_weight_replay,
+        }
 
         if self.attnres_mode == "pre_gated":
             # ---- Pre-gated delta: gate sources BEFORE softmax ----
@@ -625,16 +743,18 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
                 h_attn, max_weight = delta_attn_res(
                     blocks, partial_block, self.attn_res_proj,
                     self.attn_res_norm, attn_null, return_max_weight=True,
+                    **attn_route_kwargs,
                 )
                 routing_max_accum.append(max_weight)
             elif entropy_accum is not None:
                 h_attn, ent = delta_attn_res(blocks, partial_block,
                                              self.attn_res_proj, self.attn_res_norm, attn_null,
-                                             return_entropy=True)
+                                             return_entropy=True, **attn_route_kwargs)
                 entropy_accum.append(ent)
             else:
                 h_attn = delta_attn_res(blocks, partial_block,
-                                        self.attn_res_proj, self.attn_res_norm, attn_null)
+                                        self.attn_res_proj, self.attn_res_norm, attn_null,
+                                        **attn_route_kwargs)
             h = self._apply_gate(partial_block, h_attn, "attn")
 
             attn_out, _ = self.self_attn(
@@ -661,16 +781,18 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
                 h_attn, max_weight = delta_attn_res(
                     blocks, partial_block, self.mlp_res_proj,
                     self.mlp_res_norm, mlp_null, return_max_weight=True,
+                    **mlp_route_kwargs,
                 )
                 routing_max_accum.append(max_weight)
             elif entropy_accum is not None:
                 h_attn, ent = delta_attn_res(blocks, partial_block,
                                              self.mlp_res_proj, self.mlp_res_norm, mlp_null,
-                                             return_entropy=True)
+                                             return_entropy=True, **mlp_route_kwargs)
                 entropy_accum.append(ent)
             else:
                 h_attn = delta_attn_res(blocks, partial_block,
-                                        self.mlp_res_proj, self.mlp_res_norm, mlp_null)
+                                        self.mlp_res_proj, self.mlp_res_norm, mlp_null,
+                                        **mlp_route_kwargs)
             h = self._apply_gate(partial_block, h_attn, "mlp")
 
             mlp_out = self.mlp(self.post_attention_layernorm(h))
@@ -726,16 +848,18 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
                 h_attn, max_weight = delta_attn_res(
                     blocks, partial_block, self.attn_res_proj,
                     self.attn_res_norm, attn_null, return_max_weight=True,
+                    **attn_route_kwargs,
                 )
                 routing_max_accum.append(max_weight)
             elif entropy_accum is not None:
                 h_attn, ent = delta_attn_res(blocks, partial_block,
                                              self.attn_res_proj, self.attn_res_norm, attn_null,
-                                             return_entropy=True)
+                                             return_entropy=True, **attn_route_kwargs)
                 entropy_accum.append(ent)
             else:
                 h_attn = delta_attn_res(blocks, partial_block,
-                                        self.attn_res_proj, self.attn_res_norm, attn_null)
+                                        self.attn_res_proj, self.attn_res_norm, attn_null,
+                                        **attn_route_kwargs)
             h = self._apply_gate(partial_block, h_attn, "attn")
 
             attn_out, _ = self.self_attn(
@@ -757,16 +881,18 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
                 h_attn, max_weight = delta_attn_res(
                     blocks, partial_block, self.mlp_res_proj,
                     self.mlp_res_norm, mlp_null, return_max_weight=True,
+                    **mlp_route_kwargs,
                 )
                 routing_max_accum.append(max_weight)
             elif entropy_accum is not None:
                 h_attn, ent = delta_attn_res(blocks, partial_block,
                                              self.mlp_res_proj, self.mlp_res_norm, mlp_null,
-                                             return_entropy=True)
+                                             return_entropy=True, **mlp_route_kwargs)
                 entropy_accum.append(ent)
             else:
                 h_attn = delta_attn_res(blocks, partial_block,
-                                        self.mlp_res_proj, self.mlp_res_norm, mlp_null)
+                                        self.mlp_res_proj, self.mlp_res_norm, mlp_null,
+                                        **mlp_route_kwargs)
             h = self._apply_gate(partial_block, h_attn, "mlp")
 
             mlp_out = self.mlp(self.post_attention_layernorm(h))
@@ -863,15 +989,18 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
                 h_attn, max_weight = block_attn_res(
                     blocks, partial_block, self.attn_res_proj,
                     self.attn_res_norm, return_max_weight=True,
+                    **attn_route_kwargs,
                 )
                 routing_max_accum.append(max_weight)
             elif entropy_accum is not None:
                 h_attn, ent = block_attn_res(blocks, partial_block,
-                                             self.attn_res_proj, self.attn_res_norm, return_entropy=True)
+                                             self.attn_res_proj, self.attn_res_norm,
+                                             return_entropy=True, **attn_route_kwargs)
                 entropy_accum.append(ent)
             else:
                 h_attn = block_attn_res(blocks, partial_block,
-                                        self.attn_res_proj, self.attn_res_norm)
+                                        self.attn_res_proj, self.attn_res_norm,
+                                        **attn_route_kwargs)
             h = self._apply_gate(partial_block, h_attn, "attn")
 
             # New block boundary: store old partial, reset
@@ -895,15 +1024,18 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
                 h_attn, max_weight = block_attn_res(
                     blocks, partial_block, self.mlp_res_proj,
                     self.mlp_res_norm, return_max_weight=True,
+                    **mlp_route_kwargs,
                 )
                 routing_max_accum.append(max_weight)
             elif entropy_accum is not None:
                 h_attn, ent = block_attn_res(blocks, partial_block,
-                                             self.mlp_res_proj, self.mlp_res_norm, return_entropy=True)
+                                             self.mlp_res_proj, self.mlp_res_norm,
+                                             return_entropy=True, **mlp_route_kwargs)
                 entropy_accum.append(ent)
             else:
                 h_attn = block_attn_res(blocks, partial_block,
-                                        self.mlp_res_proj, self.mlp_res_norm)
+                                        self.mlp_res_proj, self.mlp_res_norm,
+                                        **mlp_route_kwargs)
             h = self._apply_gate(partial_block, h_attn, "mlp")
 
             mlp_out = self.mlp(self.post_attention_layernorm(h))
@@ -1024,11 +1156,13 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             h_attn, max_weight = block_attn_res(
                 blocks, partial_block, self.attn_res_proj,
                 self.attn_res_norm, return_max_weight=True,
+                **attn_route_kwargs,
             )
             routing_max_accum.append(max_weight)
         else:
             h_attn = block_attn_res(blocks, partial_block,
-                                    self.attn_res_proj, self.attn_res_norm)
+                                    self.attn_res_proj, self.attn_res_norm,
+                                    **attn_route_kwargs)
         h = self._apply_gate(partial_block, h_attn, "attn")
 
         attn_out, _ = self.self_attn(
@@ -1048,11 +1182,13 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             h_attn, max_weight = block_attn_res(
                 blocks, partial_block, self.mlp_res_proj,
                 self.mlp_res_norm, return_max_weight=True,
+                **mlp_route_kwargs,
             )
             routing_max_accum.append(max_weight)
         else:
             h_attn = block_attn_res(blocks, partial_block,
-                                    self.mlp_res_proj, self.mlp_res_norm)
+                                    self.mlp_res_proj, self.mlp_res_norm,
+                                    **mlp_route_kwargs)
         h = self._apply_gate(partial_block, h_attn, "mlp")
 
         mlp_out = self.mlp(self.post_attention_layernorm(h))
@@ -1182,6 +1318,35 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
         entropy_accum = [] if entropy_lambda > 0 else None
         return_routing_max = kwargs.pop("return_routing_max", False)
         routing_max_accum = [] if return_routing_max else None
+        routing_intervention = kwargs.pop("routing_intervention", "learned")
+        routing_permutation_seed = int(kwargs.pop("routing_permutation_seed", 0))
+        routing_weight_cache = kwargs.pop("routing_weight_cache", None)
+        routing_weight_recorder = [] if routing_intervention == "capture" else None
+        routing_weight_replay = (
+            iter(routing_weight_cache) if routing_weight_cache is not None else None
+        )
+        supported_intervention_modes = {"block", "full", "delta", "delta_block"}
+        if routing_intervention not in {"learned", "capture", "permute", "uniform"}:
+            raise ValueError(
+                f"Unknown routing intervention: {routing_intervention!r}"
+            )
+        if (
+            routing_intervention != "learned"
+            and attnres_mode not in supported_intervention_modes
+        ):
+            raise ValueError(
+                f"Routing interventions are not implemented for mode {attnres_mode!r}"
+            )
+        if routing_intervention == "permute" and routing_weight_cache is None:
+            raise ValueError(
+                "The permute intervention requires a captured routing_weight_cache"
+            )
+        if (
+            routing_intervention != "learned"
+            and self.gradient_checkpointing
+            and self.training
+        ):
+            raise ValueError("Routing interventions are evaluation-only")
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
@@ -1208,6 +1373,10 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
                     position_embeddings=position_embeddings,
                     entropy_accum=entropy_accum,
                     routing_max_accum=routing_max_accum,
+                    routing_intervention=routing_intervention,
+                    routing_permutation_seed=routing_permutation_seed,
+                    routing_weight_recorder=routing_weight_recorder,
+                    routing_weight_replay=routing_weight_replay,
                 )
 
             # delta_block: accumulate block deltas at block boundaries
@@ -1222,7 +1391,21 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
             partial_block = block_attn_res(
                 blocks, partial_block,
                 self.final_res_proj, self.final_res_norm,
+                routing_intervention=routing_intervention,
+                routing_permutation_seed=(
+                    routing_permutation_seed + 2 * len(self.layers)
+                ),
+                routing_weight_recorder=routing_weight_recorder,
+                routing_weight_replay=routing_weight_replay,
             )
+
+        if routing_weight_replay is not None:
+            try:
+                next(routing_weight_replay)
+            except StopIteration:
+                pass
+            else:
+                raise RuntimeError("Routing-weight replay cache is too long")
 
         hidden_states = self.norm(partial_block)
 
@@ -1241,6 +1424,7 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
             torch.stack(routing_max_accum).view(-1, 2).nanmean(dim=1)
             if routing_max_accum else None
         )
+        out.routing_weight_cache = routing_weight_recorder
         return out
 
 
@@ -1307,4 +1491,5 @@ class Qwen3AttnResForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
         )
         out.routing_max_weights = getattr(outputs, "routing_max_weights", None)
+        out.routing_weight_cache = getattr(outputs, "routing_weight_cache", None)
         return out

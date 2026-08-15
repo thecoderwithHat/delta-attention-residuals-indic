@@ -102,6 +102,35 @@ directions hurt, the checkpoint is instead calibrated near its learned routing
 temperature; that result does not support the stronger claim that sharpness by
 itself explains the quality gap between architectures.
 
+### Routing source-selection intervention
+
+Logit scaling changes routing confidence but usually preserves the winning
+source. Test whether the learned source identity matters by comparing it with
+probability-preserving source permutations and exactly uniform routing:
+
+```bash
+python test_routing_selection.py \
+    --checkpoint Delta-AttnRes=output/delta/final \
+    --text-file evaluation_text.txt \
+    --permutation-seeds 0 1 2 3 4 \
+    --output routing_source_selection.png
+```
+
+The script first captures every learned routing distribution for each document.
+Each permutation seed then replays those exact probabilities while applying a
+deterministic derangement at every routing site, so none remains attached to its
+original source. This cache-and-replay design prevents upstream perturbations
+from indirectly changing later routing probabilities. The script averages the
+permutation effects across seeds and reports paired document-bootstrap
+confidence intervals relative to learned routing. Uniform routing sets every
+source probability to exactly `1/N`.
+
+If permutation hurts while max-weight remains similar, performance depends on
+selecting the correct historical representation rather than merely producing a
+sharp distribution. If uniform routing also hurts, the learned depth-selection
+policy is useful. As with the sharpness experiment, supported modes are
+`block`, `full`, `delta`, and `delta_block`.
+
 ### Training from scratch (7B+, FSDP)
 
 ```bash
@@ -118,11 +147,31 @@ torchrun --standalone --nproc_per_node=8 train_scratch_fsdp.py \
 
 ```bash
 torchrun --standalone --nproc_per_node=4 train_finetune.py \
-    --base_model Qwen/Qwen3-0.6B \
+    --pretrained Qwen/Qwen3-0.6B \
     --mode delta_block \
     --lr 5e-5 --lr_attnres 5e-3 \
-    --steps 20000
+    --steps 20000 \
+    --gradient_checkpointing
 ```
+
+Fine-tuning checkpoints include the model, optimizer, learning-rate scheduler,
+per-rank RNG state, and streaming-dataset position. Resume from the latest
+checkpoint in `--out_dir` with a bare `--resume`, or select one explicitly:
+
+```bash
+torchrun --standalone --nproc_per_node=4 train_finetune.py \
+    --pretrained Qwen/Qwen3-0.6B \
+    --mode delta_block \
+    --steps 20000 \
+    --out_dir ./output/my-run \
+    --resume ./output/my-run/step-10000
+```
+
+Resume with the same process count and optimization flags used to create the
+checkpoint. `--steps` remains the final target step, not an additional count.
+Intermediate `step-*` checkpoints are retained if training is interrupted. After
+successful completion, the script saves `final/` and removes the numbered
+checkpoints so only the final checkpoint remains.
 
 ### Indic benchmarks
 
