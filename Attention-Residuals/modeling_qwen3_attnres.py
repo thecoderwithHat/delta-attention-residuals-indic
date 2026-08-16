@@ -188,7 +188,7 @@ def _routing_intervention_kernel(
     intervention: str,
     permutation_seed: int,
     cached_weights: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Route with an evaluation-only source-selection intervention.
 
     ``permute`` keeps every learned probability unchanged and applies a
@@ -317,13 +317,14 @@ def _delta_attn_res_kernel(
     partial_block: torch.Tensor,  # [B, T, D]
     query: torch.Tensor,          # (D,)
     norm: Qwen3RMSNorm,
+    routing_branch_scale: float = 1.0,
 ) -> torch.Tensor:
     """Compiled inner kernel for delta_attn_res (no Python list ops)."""
     K = norm(V)
     logits = torch.einsum("d, n b t d -> n b t", query, K)
     weights = logits.softmax(dim=0)
     selected = torch.einsum("n b t, n b t d -> b t d", weights, V)
-    return partial_block + selected
+    return partial_block + routing_branch_scale * selected
 
 
 def _delta_attn_res_kernel_with_entropy(
@@ -331,13 +332,14 @@ def _delta_attn_res_kernel_with_entropy(
     partial_block: torch.Tensor,
     query: torch.Tensor,
     norm: Qwen3RMSNorm,
+    routing_branch_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compiled inner kernel for delta_attn_res with entropy (no Python list ops)."""
     K = norm(V)
     logits = torch.einsum("d, n b t d -> n b t", query, K)
     weights = logits.softmax(dim=0)
     selected = torch.einsum("n b t, n b t d -> b t d", weights, V)
-    h = partial_block + selected
+    h = partial_block + routing_branch_scale * selected
     entropy = -(weights * (weights + 1e-8).log()).sum(dim=0).mean()
     return h, entropy
 
@@ -347,15 +349,24 @@ def _delta_attn_res_kernel_with_max_weight(
     partial_block: torch.Tensor,
     query: torch.Tensor,
     norm: Qwen3RMSNorm,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the routed state and mean maximum source probability."""
+    routing_branch_scale: float = 1.0,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Return the route plus its probability and magnitude diagnostics."""
     K = norm(V)
     logits = torch.einsum("d, n b t d -> n b t", query, K)
     weights = logits.softmax(dim=0)
     selected = torch.einsum("n b t, n b t d -> b t d", weights, V)
-    h = partial_block + selected
+    h = partial_block + routing_branch_scale * selected
     max_weight = weights.amax(dim=0).mean()
-    return h, max_weight
+    entropy = -(weights * (weights + 1e-8).log()).sum(dim=0).mean()
+    routed_l2 = selected.float().norm(dim=-1).mean()
+    residual_l2 = partial_block.float().norm(dim=-1).clamp_min(1e-12)
+    scaled_routed_ratio = (
+        abs(routing_branch_scale) * selected.float().norm(dim=-1) / residual_l2
+    ).mean()
+    return h, entropy, max_weight, routed_l2, scaled_routed_ratio
 
 
 def delta_attn_res(
@@ -370,6 +381,8 @@ def delta_attn_res(
     routing_permutation_seed: int = 0,
     routing_weight_recorder: list[torch.Tensor] | None = None,
     routing_weight_replay: Iterator[torch.Tensor] | None = None,
+    routing_branch_scale: float = 1.0,
+    routing_magnitude_accum: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Attend over previous sublayer deltas and add selected information to
@@ -379,10 +392,13 @@ def delta_attn_res(
     all weight on null_source (zeros), the output is partial_block (identity).
     This enables exact identity initialization for fine-tuning pretrained models.
 
-        h = partial_block + weighted_sum([null_source] + deltas)
+        h = partial_block + routing_branch_scale * weighted_sum([null_source] + deltas)
         init: null_source=0, proj=0 -> uniform weights -> Σα·v ≈ 0 -> h ≈ partial_block
     """
     if not deltas and null_source is None:
+        if routing_magnitude_accum is not None:
+            zero = torch.tensor(0.0, device=partial_block.device)
+            routing_magnitude_accum.append((zero, zero))
         if return_max_weight:
             return partial_block, torch.tensor(
                 float("nan"), device=partial_block.device
@@ -398,6 +414,9 @@ def delta_attn_res(
         sources = [null_expanded] + sources
 
     if not sources:
+        if routing_magnitude_accum is not None:
+            zero = torch.tensor(0.0, device=partial_block.device)
+            routing_magnitude_accum.append((zero, zero))
         if return_max_weight:
             return partial_block, torch.tensor(
                 float("nan"), device=partial_block.device
@@ -427,24 +446,42 @@ def delta_attn_res(
         )
         if routing_weight_recorder is not None:
             routing_weight_recorder.append(weights.detach())
-        h = partial_block + selected
+        h = partial_block + routing_branch_scale * selected
+        if routing_magnitude_accum is not None:
+            routed_l2 = selected.float().norm(dim=-1).mean()
+            residual_l2 = partial_block.float().norm(dim=-1).clamp_min(1e-12)
+            scaled_ratio = (
+                abs(routing_branch_scale)
+                * selected.float().norm(dim=-1)
+                / residual_l2
+            ).mean()
+            routing_magnitude_accum.append((routed_l2, scaled_ratio))
         if return_max_weight:
             return h, max_weight
         if return_entropy:
             return h, entropy
         return h
 
-    if return_max_weight:
-        return _delta_attn_res_kernel_with_max_weight(
-            V, partial_block, query, norm
+    if return_max_weight or routing_magnitude_accum is not None:
+        h, entropy, max_weight, routed_l2, scaled_ratio = (
+            _delta_attn_res_kernel_with_max_weight(
+                V, partial_block, query, norm, routing_branch_scale
+            )
         )
+        if routing_magnitude_accum is not None:
+            routing_magnitude_accum.append((routed_l2, scaled_ratio))
+        if return_max_weight:
+            return h, max_weight
+        if return_entropy:
+            return h, entropy
+        return h
 
     if return_entropy:
         kernel = _compiled_delta_kernel_entropy or _delta_attn_res_kernel_with_entropy
-        return kernel(V, partial_block, query, norm)
+        return kernel(V, partial_block, query, norm, routing_branch_scale)
 
     kernel = _compiled_delta_kernel or _delta_attn_res_kernel
-    return kernel(V, partial_block, query, norm)
+    return kernel(V, partial_block, query, norm, routing_branch_scale)
 
 
 def gated_delta_attn_res(
@@ -528,6 +565,9 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
 
         # AttnRes mode
         self.attnres_mode = getattr(config, "attnres_mode", "block")
+        # Evaluation-only multiplier for the post-softmax additive Delta route.
+        # This is deliberately a plain attribute, not a checkpoint parameter.
+        self.routing_branch_scale = 1.0
 
         # Use V-stream decoupled attention for delta_v and full_v modes
         if self.attnres_mode in ("delta_v", "full_v"):
@@ -640,6 +680,7 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
         routing_permutation_seed = kwargs.pop("routing_permutation_seed", 0)
         routing_weight_recorder = kwargs.pop("routing_weight_recorder", None)
         routing_weight_replay = kwargs.pop("routing_weight_replay", None)
+        routing_magnitude_accum = kwargs.pop("routing_magnitude_accum", None)
         attn_route_kwargs = {
             "routing_intervention": routing_intervention,
             "routing_permutation_seed": routing_permutation_seed + 2 * self.layer_idx,
@@ -652,6 +693,11 @@ class Qwen3AttnResDecoderLayer(GradientCheckpointingLayer):
             "routing_weight_recorder": routing_weight_recorder,
             "routing_weight_replay": routing_weight_replay,
         }
+        if self.attnres_mode in ("delta", "delta_block"):
+            attn_route_kwargs["routing_branch_scale"] = self.routing_branch_scale
+            mlp_route_kwargs["routing_branch_scale"] = self.routing_branch_scale
+            attn_route_kwargs["routing_magnitude_accum"] = routing_magnitude_accum
+            mlp_route_kwargs["routing_magnitude_accum"] = routing_magnitude_accum
 
         if self.attnres_mode == "pre_gated":
             # ---- Pre-gated delta: gate sources BEFORE softmax ----
@@ -1318,6 +1364,8 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
         entropy_accum = [] if entropy_lambda > 0 else None
         return_routing_max = kwargs.pop("return_routing_max", False)
         routing_max_accum = [] if return_routing_max else None
+        return_routing_magnitude = kwargs.pop("return_routing_magnitude", False)
+        routing_magnitude_accum = [] if return_routing_magnitude else None
         routing_intervention = kwargs.pop("routing_intervention", "learned")
         routing_permutation_seed = int(kwargs.pop("routing_permutation_seed", 0))
         routing_weight_cache = kwargs.pop("routing_weight_cache", None)
@@ -1377,6 +1425,7 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
                     routing_permutation_seed=routing_permutation_seed,
                     routing_weight_recorder=routing_weight_recorder,
                     routing_weight_replay=routing_weight_replay,
+                    routing_magnitude_accum=routing_magnitude_accum,
                 )
 
             # delta_block: accumulate block deltas at block boundaries
@@ -1423,6 +1472,18 @@ class Qwen3AttnResModel(Qwen3PreTrainedModel):
         out.routing_max_weights = (
             torch.stack(routing_max_accum).view(-1, 2).nanmean(dim=1)
             if routing_max_accum else None
+        )
+        out.routing_routed_l2 = (
+            torch.stack([item[0] for item in routing_magnitude_accum])
+            .view(-1, 2)
+            .mean(dim=1)
+            if routing_magnitude_accum else None
+        )
+        out.routing_scaled_ratio = (
+            torch.stack([item[1] for item in routing_magnitude_accum])
+            .view(-1, 2)
+            .mean(dim=1)
+            if routing_magnitude_accum else None
         )
         out.routing_weight_cache = routing_weight_recorder
         return out
@@ -1491,5 +1552,7 @@ class Qwen3AttnResForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
         )
         out.routing_max_weights = getattr(outputs, "routing_max_weights", None)
+        out.routing_routed_l2 = getattr(outputs, "routing_routed_l2", None)
+        out.routing_scaled_ratio = getattr(outputs, "routing_scaled_ratio", None)
         out.routing_weight_cache = getattr(outputs, "routing_weight_cache", None)
         return out
