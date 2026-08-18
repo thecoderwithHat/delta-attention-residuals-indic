@@ -56,8 +56,8 @@ PAPER_TASKS = [
     "lambada_openai",
     "milu",
     "ifeval_hi",
-    "gsm8khi",
-    "bfcl_hi",
+    # "gsm8khi",
+    # "bfcl_hi",
 ]
 
 # Concise task set for quick sanity checks
