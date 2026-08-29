@@ -1,10 +1,6 @@
-# Delta Attention Residuals
+# Delta Attention Residuals NewInML
 
-Official code for **"Delta Attention Residuals: Per-Sublayer Sources for Cross-Layer Information Flow"**.
 
-Cheng Luo, Zefan Cai, Junjie Hu
-
-[[Paper]](https://github.com/wdlctc/delta-attention-residuals-arxiv)
 
 ## Overview
 
@@ -149,33 +145,9 @@ python eval_downstream.py \
 For a short smoke test, add `--limit 10`. Select categories with
 `--bfcl_categories simple,parallel`; the default is `all`.
 
-## Results & W&B Runs
 
-The exact W&B run for every paper experiment is listed in [`WANDB_RUNS.md`](./WANDB_RUNS.md) (training/validation curves, configs, and system metrics). Project: <https://wandb.ai/wdlctc_abr/attention-residual-h100>.
 
-### From-Scratch Training (10K steps, FineWeb-Edu)
 
-| Scale | Baseline | AttnRes | Delta Block | Delta AttnRes |
-|-------|----------|---------|-------------|---------------|
-| 220M  | 38.71    | 37.39   | **37.08**   | **36.83**     |
-| 533M  | 32.00    | 31.75   | **31.16**   | **31.05**     |
-| 1044M | 29.70    | 31.76   | **29.19**   | **29.13**     |
-
-### Fine-tuning Qwen3-0.6B (downstream avg accuracy)
-
-| Baseline FT | AttnRes | Delta Block |
-|-------------|---------|-------------|
-| 55.0%       | 54.1%   | **55.6%**   |
-
-## Citation
-
-```bibtex
-@article{luo2026delta,
-  title={Delta Attention Residuals},
-  author={Luo, Cheng and Cai, Zefan and Hu, Junjie},
-  year={2026}
-}
-```
 
 ## License
 
